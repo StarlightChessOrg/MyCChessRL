@@ -38,13 +38,15 @@ def _setup_logging(log_file: Path | None) -> None:
 
 
 def _cuda_mem_mb(device: torch.device) -> str:
+    """``memory_allocated``≈仍被张量占用的块；``memory_reserved``含 PyTorch 缓存池（峰值后常远高于 alloc，一般不是泄漏）。"""
     if device.type != "cuda" or not torch.cuda.is_available():
         return "n/a"
     try:
         idx = device.index if device.index is not None else 0
         alloc = torch.cuda.memory_allocated(idx) / (1024**2)
         reserv = torch.cuda.memory_reserved(idx) / (1024**2)
-        return f"alloc={alloc:.0f}MB reserved={reserv:.0f}MB"
+        peak = torch.cuda.max_memory_allocated(idx) / (1024**2)
+        return f"torch_alloc={alloc:.0f}MB torch_reserved={reserv:.0f}MB peak_alloc={peak:.0f}MB"
     except Exception:
         return "n/a"
 
@@ -117,6 +119,13 @@ def main() -> None:
         help="rollout 采样/价值前向时 CPU 编码分组数；>=2 时两半局面并行编码（主线程+守护线程）再拼批一次 trunk，"
         "叠合准备空档；1=关闭（与旧行为一致）",
     )
+    p.add_argument(
+        "--cuda-empty-cache-each-update",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="每轮 PPO 优化结束后释放本轮 GPU 大张量并 torch.cuda.empty_cache()；"
+        "nvidia-smi 里「常驻」多为 reserved 缓存，非泄漏。用 --no-cuda-empty-cache-each-update 可关闭（略省开销）",
+    )
     args = p.parse_args()
 
     _setup_logging(args.log_file)
@@ -157,6 +166,7 @@ def main() -> None:
         idx = device.index if device.index is not None else 0
         name = torch.cuda.get_device_name(idx)
         _LOG.info("CUDA 设备: [%d] %s", idx, name)
+        torch.cuda.reset_peak_memory_stats(idx)
     _LOG.info(
         "特征编码 backend=%s encode_workers=%d（仅 thread/process）| rollout_pipeline_groups=%d | PPO mini-batch=%d",
         enc_be,
@@ -342,6 +352,10 @@ def main() -> None:
 
         src_b = torch.stack(src_list, dim=0)
         dst_b = torch.stack(dst_list, dim=0)
+        # stack 已拷贝数据；列表里仍挂着数万个小张量，会重复占显存，必须立刻丢掉。
+        src_list.clear()
+        dst_list.clear()
+
         adv_b = torch.clamp(torch.tensor(adv_list, device=device), -5.0, 5.0)
         ret_b = torch.clamp(torch.tensor(ret_list, device=device), -10.0, 10.0)
         old_v = torch.tensor(old_v_list, device=device)
@@ -359,6 +373,15 @@ def main() -> None:
             cfg,
             mini_batch_size=int(args.ppo_mini_batch),
         )
+        del xb, src_b, dst_b, old_lp, adv_b, ret_b, old_v
+        obs_list.clear()
+        mv_list.clear()
+        adv_list.clear()
+        ret_list.clear()
+        old_v_list.clear()
+        if device.type == "cuda" and bool(getattr(args, "cuda_empty_cache_each_update", True)):
+            torch.cuda.empty_cache()
+
         t_opt1 = time.perf_counter()
         optimize_s = t_opt1 - t_opt0
         upd_s = time.perf_counter() - t_upd0

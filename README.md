@@ -56,6 +56,8 @@ mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 
 默认训练超参面向 **约 24 核 CPU、64GB 内存、单卡 A100 40GB**（例如 `--n-env 384 --steps 192 --updates 800`）；价值估计与 rollout 旧对数概率均尽量 **批前向** 以提高 GPU 利用率。优化阶段若整批前向（样本数 ≈ `n_env × steps`）会占满激活显存，可用 **`--ppo-mini-batch`**（默认 4096）按小批 **梯度累积** 做 PPO 反向，峰值显存随该值近似线性变化；仍 OOM 时再调小 `--ppo-mini-batch`、`--n-env` 或 `--steps`。
 
+训练日志里的 **torch_reserved** 多为 CUDA 分配器缓存（首轮大包峰值后常明显高于 **torch_alloc**），一般不是显存泄漏；每轮结束后脚本会 `del` 大张量并默认 `torch.cuda.empty_cache()`（可用 `--no-cuda-empty-cache-each-update` 关闭）。碎片严重时可试环境变量 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
+
 ## 特征说明
 
 ResNet 茎输入为 **14×10×9**（与 icyElephant 数据管线一致）。icy 原版第二阶段曾用 **15 路**（14 棋子 + 1 路起点掩码）喂第二个卷积塔；本仓库仍用 **单塔 trunk**，仅在全连接 `head_dst` 处拼接起点 one-hot，与 icy 的卷积分塔不完全相同，但**棋盘侧张量**已与 icy 对齐。曾用 **65 通道** 旧权重与当前 `stem_conv` **不兼容**，需重新训练。
