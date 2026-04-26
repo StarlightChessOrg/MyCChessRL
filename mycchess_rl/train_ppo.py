@@ -14,12 +14,11 @@ from mycchess_rl.vec_env import ParallelXiangqiVecEnv, collect_rollout_step, res
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="MyCChessRL 并行 PPO 自对弈")
+    p = argparse.ArgumentParser(description="MyCChessRL 并行 PPO 自对弈（规则：xqwl_core）")
     p.add_argument("--n-env", type=int, default=32, help="并行环境数")
     p.add_argument("--steps", type=int, default=64, help="每次更新前收集的并行步数")
     p.add_argument("--updates", type=int, default=100, help="PPO 更新次数")
     p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--no-cpp", action="store_true", help="强制使用 Python 规则后端")
     p.add_argument("--checkpoint", type=Path, default=None, help="从已有权重微调；省略则随机初始化")
     p.add_argument("--lr", type=float, default=3e-4)
     args = p.parse_args()
@@ -40,7 +39,7 @@ def main() -> None:
 
     cfg = PPOConfig(lr=args.lr)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    vec = ParallelXiangqiVecEnv(args.n_env, prefer_cpp=not args.no_cpp)
+    vec = ParallelXiangqiVecEnv(args.n_env)
     vec.reset_all()
 
     T = args.steps
@@ -55,10 +54,10 @@ def main() -> None:
         val_buf = np.zeros((T, N), dtype=np.float32)
 
         with torch.no_grad():
-            v_cur = batched_value_expectation([s.gp_mirror for s in vec.slots], model, device, flist).cpu().numpy()
+            v_cur = batched_value_expectation([s.game for s in vec.slots], model, device, flist).cpu().numpy()
 
         for t in range(T):
-            gps_pre = [s.gp_mirror for s in vec.slots]
+            gps_pre = [s.game for s in vec.slots]
             for i in range(N):
                 obs_buf[t][i] = gps_pre[i]
             val_buf[t] = v_cur
@@ -71,11 +70,11 @@ def main() -> None:
             done_buf[t] = done
 
             with torch.no_grad():
-                v_cur = batched_value_expectation([s.gp_mirror for s in vec.slots], model, device, flist).cpu().numpy()
+                v_cur = batched_value_expectation([s.game for s in vec.slots], model, device, flist).cpu().numpy()
             reset_finished(vec, done)
 
         with torch.no_grad():
-            last_v = batched_value_expectation([s.gp_mirror for s in vec.slots], model, device, flist).cpu().numpy()
+            last_v = batched_value_expectation([s.game for s in vec.slots], model, device, flist).cpu().numpy()
         adv, ret = compute_gae(rew_buf, val_buf, done_buf, last_v, gamma=cfg.gamma, lam=cfg.gae_lambda)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 

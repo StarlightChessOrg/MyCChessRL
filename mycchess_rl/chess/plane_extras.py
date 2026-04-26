@@ -1,19 +1,13 @@
-"""策略网络额外输入平面：坐标、步序、飞将、着法并集、上一手、子力、将距、吃子目标、车马炮控制等。"""
-
+"""额外提示平面（仅用棋盘矩阵 + 当前方合法着 ICCS 列表，不依赖 cchess）。"""
 from __future__ import annotations
 
 import numpy as np
 
-from cchess.board import BaseChessBoard, ChessBoard
-from cchess.piece import ChessSide, PieceT, fench_to_species
+from mycchess_rl.iccs_util import parse_move_squares
+from mycchess_rl.piece_types import ChessSide, PieceT, fench_to_species
 
-from mycchess_rl.chess.board_utils import chess_board_from_base
-
-# 与 rationale 中常量相加得到 POLICY_SELECT_IN_CHANNELS（见 rationale.py）
 EXTRA_HINT_PLANE_COUNT = 47
-
-# 与 rationale.PIECE_VALUE_BY_FENCH 量纲一致（将帅 0），避免 rationale↔plane_extras 循环 import
-_MAT_SUM_DENOM = 55.0  # 约两车+子力上界，用于归一化总子力广播
+_MAT_SUM_DENOM = 55.0
 
 
 def _mat_val(ch: str) -> float:
@@ -74,22 +68,11 @@ def _kings_face_plane(boardarr: np.ndarray) -> np.ndarray:
     return np.full((10, 9), 1.0, dtype=np.float32)
 
 
-def _cb_for_side(cb0: ChessBoard, side: ChessSide) -> ChessBoard:
-    cb = cb0.copy()
-    cb.move_side = side
-    return cb
-
-
-def _union_legal_move_destinations(cb0: ChessBoard, side: ChessSide) -> np.ndarray:
+def _union_move_destinations(legal_iccs: list[str]) -> np.ndarray:
     out = np.zeros((10, 9), dtype=np.float32)
-    cb = _cb_for_side(cb0, side)
-    for p in cb.get_side_pieces(side):
-        for mv in p.create_moves():
-            if cb.is_valid_move_t(mv):
-                _pf, pt = mv
-                iy = 9 - pt.y
-                ix = pt.x
-                out[iy, ix] = 1.0
+    for mv in legal_iccs:
+        _x1, _y1, x2, y2 = parse_move_squares(mv)
+        out[y2, x2] = 1.0
     return out
 
 
@@ -98,8 +81,6 @@ def _last_move_planes(last_move: str | None) -> tuple[np.ndarray, np.ndarray]:
     b = np.zeros((10, 9), dtype=np.float32)
     if not last_move or len(last_move) < 5 or last_move[2] != "-":
         return a, b
-    from mycchess_rl.chess.features import parse_move_squares
-
     try:
         x1, y1, x2, y2 = parse_move_squares(last_move)
     except ValueError:
@@ -114,7 +95,7 @@ def _material_broadcast(boardarr: np.ndarray, stm: ChessSide) -> tuple[np.ndarra
     s_opp = 0.0
     for iy in range(10):
         for ix in range(9):
-            ch = boardarr[iy, ix]
+            ch = str(boardarr[iy, ix])
             if not ch:
                 continue
             v = _mat_val(ch)
@@ -131,7 +112,6 @@ def _material_broadcast(boardarr: np.ndarray, stm: ChessSide) -> tuple[np.ndarra
 
 
 def _king_geometry(boardarr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """将帅曼哈顿距离 /17 广播；是否同横排（iy 相同）广播 0/1。"""
     k_red: tuple[int, int] | None = None
     k_blk: tuple[int, int] | None = None
     for iy in range(10):
@@ -162,7 +142,7 @@ def _major_ratio(boardarr: np.ndarray, side: ChessSide) -> np.ndarray:
     c = 0
     for iy in range(10):
         for ix in range(9):
-            ch = boardarr[iy, ix]
+            ch = str(boardarr[iy, ix])
             if not ch:
                 continue
             sp, sd = fench_to_species(ch)
@@ -171,30 +151,23 @@ def _major_ratio(boardarr: np.ndarray, side: ChessSide) -> np.ndarray:
     return np.full((10, 9), min(1.0, c / 6.0), dtype=np.float32)
 
 
-def _capture_destination_union(cb0: ChessBoard, attacker: ChessSide) -> np.ndarray:
-    """攻击方所有「吃子」合法着法的落点并集（0/1）。"""
+def _capture_dst_union(boardarr: np.ndarray, legal_iccs: list[str], mover_red: bool) -> np.ndarray:
     out = np.zeros((10, 9), dtype=np.float32)
-    cb = _cb_for_side(cb0, attacker)
-    opp = ChessSide.next_side(attacker)
-    for p in cb.get_side_pieces(attacker):
-        for mv in p.create_moves():
-            if not cb.is_valid_move_t(mv):
-                continue
-            pf, pt = mv
-            f_to = cb._board[pt.y][pt.x]
-            if not f_to:
-                continue
-            _sp_to, side_to = fench_to_species(f_to)
-            if side_to != opp:
-                continue
-            iy = 9 - pt.y
-            ix = pt.x
-            out[iy, ix] = 1.0
+    stm = ChessSide.RED if mover_red else ChessSide.BLACK
+    opp = ChessSide.next_side(stm)
+    for mv in legal_iccs:
+        x1, y1, x2, y2 = parse_move_squares(mv)
+        dest = str(boardarr[y2, x2])
+        if not dest:
+            continue
+        _, sd_src = fench_to_species(str(boardarr[y1, x1]))
+        _, sd_dst = fench_to_species(dest)
+        if sd_src == stm and sd_dst == opp:
+            out[y2, x2] = 1.0
     return out
 
 
 def _pawn_progress_plane(boardarr: np.ndarray) -> np.ndarray:
-    """兵/卒：红兵 ``(9-iy)/9``，黑卒 ``iy/9``，其余格 0。"""
     out = np.zeros((10, 9), dtype=np.float32)
     for iy in range(10):
         for ix in range(9):
@@ -206,24 +179,21 @@ def _pawn_progress_plane(boardarr: np.ndarray) -> np.ndarray:
     return out
 
 
-def _piece_attack_union(cb0: ChessBoard, side: ChessSide, species: PieceT) -> np.ndarray:
-    """指定方某兵种能走到的所有合法落点（含吃与不吃），需在 ``cb`` 上临时 ``move_side=side``。"""
+def _species_dst_union(boardarr: np.ndarray, legal_iccs: list[str], species: PieceT) -> np.ndarray:
     out = np.zeros((10, 9), dtype=np.float32)
-    cb = _cb_for_side(cb0, side)
-    for p in cb.get_side_pieces(side):
-        if p.species != species:
+    for mv in legal_iccs:
+        x1, y1, x2, y2 = parse_move_squares(mv)
+        ch = str(boardarr[y1, x1])
+        if not ch:
             continue
-        for mv in p.create_moves():
-            if cb.is_valid_move_t(mv):
-                _pf, pt = mv
-                iy = 9 - pt.y
-                ix = pt.x
-                out[iy, ix] = 1.0
+        sp, _ = fench_to_species(ch)
+        if sp != species:
+            continue
+        out[y2, x2] = 1.0
     return out
 
 
 def _river_band_plane() -> np.ndarray:
-    """楚河汉界附近两横排（``iy`` 4、5）标 1。"""
     out = np.zeros((10, 9), dtype=np.float32)
     out[4, :] = 1.0
     out[5, :] = 1.0
@@ -231,7 +201,6 @@ def _river_band_plane() -> np.ndarray:
 
 
 def _half_board_planes() -> tuple[np.ndarray, np.ndarray]:
-    """红方半场（``iy>=5``）、黑方半场（``iy<=4``），与 ``get_board_arr`` 纵轴一致。"""
     red = np.zeros((10, 9), dtype=np.float32)
     blk = np.zeros((10, 9), dtype=np.float32)
     red[5:, :] = 1.0
@@ -249,7 +218,6 @@ def _find_king_iccs(boardarr: np.ndarray, side: ChessSide) -> tuple[int, int] | 
 
 
 def _king_ortho_neighbor_density(boardarr: np.ndarray, side: ChessSide) -> np.ndarray:
-    """帅/将四正邻有子数 / 4，全图广播。"""
     pos = _find_king_iccs(boardarr, side)
     if pos is None:
         return np.zeros((10, 9), dtype=np.float32)
@@ -264,7 +232,6 @@ def _king_ortho_neighbor_density(boardarr: np.ndarray, side: ChessSide) -> np.nd
 
 
 def _king_cross_empty_rays(boardarr: np.ndarray, side: ChessSide) -> np.ndarray:
-    """从己方帅/将出发四向射线，直到挡子为止，中间空格标 1。"""
     out = np.zeros((10, 9), dtype=np.float32)
     pos = _find_king_iccs(boardarr, side)
     if pos is None:
@@ -283,43 +250,39 @@ def _king_cross_empty_rays(boardarr: np.ndarray, side: ChessSide) -> np.ndarray:
     return out
 
 
-def _pawn_capture_only_union(cb0: ChessBoard, side: ChessSide) -> np.ndarray:
-    """兵/卒仅吃子的合法落点并集。"""
+def _pawn_capture_union(boardarr: np.ndarray, legal_iccs: list[str], mover_red: bool) -> np.ndarray:
     out = np.zeros((10, 9), dtype=np.float32)
-    cb = _cb_for_side(cb0, side)
-    opp = ChessSide.next_side(side)
-    for p in cb.get_side_pieces(side):
-        if p.species != PieceT.PAWN:
+    stm = ChessSide.RED if mover_red else ChessSide.BLACK
+    opp = ChessSide.next_side(stm)
+    for mv in legal_iccs:
+        x1, y1, x2, y2 = parse_move_squares(mv)
+        ch = str(boardarr[y1, x1])
+        if not ch:
             continue
-        for mv in p.create_moves():
-            if not cb.is_valid_move_t(mv):
-                continue
-            pf, pt = mv
-            f_to = cb._board[pt.y][pt.x]
-            if not f_to:
-                continue
-            _st, side_to = fench_to_species(f_to)
-            if side_to != opp:
-                continue
-            iy = 9 - pt.y
-            ix = pt.x
-            out[iy, ix] = 1.0
+        sp, sd = fench_to_species(ch)
+        if sp != PieceT.PAWN or sd != stm:
+            continue
+        dest = str(boardarr[y2, x2])
+        if not dest:
+            continue
+        _, sd2 = fench_to_species(dest)
+        if sd2 == opp:
+            out[y2, x2] = 1.0
     return out
 
 
-def _bishop_advisor_union(cb0: ChessBoard, side: ChessSide) -> np.ndarray:
+def _bishop_advisor_union(boardarr: np.ndarray, legal_iccs: list[str], mover_red: bool) -> np.ndarray:
     out = np.zeros((10, 9), dtype=np.float32)
-    cb = _cb_for_side(cb0, side)
-    for sp in (PieceT.BISHOP, PieceT.ADVISOR):
-        for p in cb.get_side_pieces(side):
-            if p.species != sp:
-                continue
-            for mv in p.create_moves():
-                if cb.is_valid_move_t(mv):
-                    _pf, pt = mv
-                    iy = 9 - pt.y
-                    ix = pt.x
-                    out[iy, ix] = 1.0
+    stm = ChessSide.RED if mover_red else ChessSide.BLACK
+    for mv in legal_iccs:
+        x1, y1, x2, y2 = parse_move_squares(mv)
+        ch = str(boardarr[y1, x1])
+        if not ch:
+            continue
+        sp, sd = fench_to_species(ch)
+        if sd != stm or sp not in (PieceT.BISHOP, PieceT.ADVISOR):
+            continue
+        out[y2, x2] = 1.0
     return out
 
 
@@ -327,7 +290,7 @@ def _count_species(boardarr: np.ndarray, side: ChessSide, species: PieceT) -> in
     c = 0
     for iy in range(10):
         for ix in range(9):
-            ch = boardarr[iy, ix]
+            ch = str(boardarr[iy, ix])
             if not ch:
                 continue
             sp, sd = fench_to_species(ch)
@@ -336,127 +299,76 @@ def _count_species(boardarr: np.ndarray, side: ChessSide, species: PieceT) -> in
     return c
 
 
-def _species_count_broadcast(
-    boardarr: np.ndarray, side: ChessSide, species: PieceT, denom: float
-) -> np.ndarray:
+def _species_count_broadcast(boardarr: np.ndarray, side: ChessSide, species: PieceT, denom: float) -> np.ndarray:
     c = _count_species(boardarr, side, species)
     return np.full((10, 9), min(1.0, float(c) / denom), dtype=np.float32)
 
 
 def encode_extra_hint_planes(
     boardarr: np.ndarray,
-    board_state: BaseChessBoard,
+    red_to_move: bool,
     *,
+    legal_iccs: list[str],
+    in_check: bool,
     move_index: int | None = None,
     last_move: str | None = None,
 ) -> np.ndarray:
-    """
-    返回 ``(EXTRA_HINT_PLANE_COUNT, 10, 9)`` float32。
-
-    0–23：坐标、步序、飞将、着法并集、上一手、子力与将几何、占子、大子比、吃子目标、兵纵深、双方车马炮控制。
-
-    24–46：河界带；红/黑半场；双方将四邻有子密度；兵卒吃子落点；象士合法落点并集；将四向空射线；
-    双方车/马/炮/象/士/兵个数广播（各除以典型上界 2,2,2,2,2,5）。
-    """
+    _ = in_check
     coord = _coord_planes_cached()
     ply = _ply_broadcast_plane(move_index)[np.newaxis, ...]
     face = _kings_face_plane(boardarr)[np.newaxis, ...]
-    stm_d = np.zeros((1, 10, 9), dtype=np.float32)
+    stm_side = ChessSide.RED if red_to_move else ChessSide.BLACK
+    opp_side = ChessSide.next_side(stm_side)
+
+    stm_d = _union_move_destinations(legal_iccs)[np.newaxis, ...]
     opp_d = np.zeros((1, 10, 9), dtype=np.float32)
+
     lf = np.zeros((1, 10, 9), dtype=np.float32)
     lt = np.zeros((1, 10, 9), dtype=np.float32)
-    mstm = np.zeros((1, 10, 9), dtype=np.float32)
-    mopp = np.zeros((1, 10, 9), dtype=np.float32)
-    kdist = np.zeros((1, 10, 9), dtype=np.float32)
-    krank = np.zeros((1, 10, 9), dtype=np.float32)
-    dens = np.zeros((1, 10, 9), dtype=np.float32)
-    maj_s = np.zeros((1, 10, 9), dtype=np.float32)
-    maj_o = np.zeros((1, 10, 9), dtype=np.float32)
-    cap_s = np.zeros((1, 10, 9), dtype=np.float32)
-    cap_o = np.zeros((1, 10, 9), dtype=np.float32)
-    pwn = np.zeros((1, 10, 9), dtype=np.float32)
-    orook = np.zeros((1, 10, 9), dtype=np.float32)
-    ocann = np.zeros((1, 10, 9), dtype=np.float32)
-    oknight = np.zeros((1, 10, 9), dtype=np.float32)
-    srook = np.zeros((1, 10, 9), dtype=np.float32)
-    scann = np.zeros((1, 10, 9), dtype=np.float32)
-    sknight = np.zeros((1, 10, 9), dtype=np.float32)
-
-    river = _river_band_plane()[np.newaxis, ...]
-    red_h, blk_h = _half_board_planes()
-    rh = red_h[np.newaxis, ...]
-    bh = blk_h[np.newaxis, ...]
-    knei_s = np.zeros((1, 10, 9), dtype=np.float32)
-    knei_o = np.zeros((1, 10, 9), dtype=np.float32)
-    pcap_s = np.zeros((1, 10, 9), dtype=np.float32)
-    pcap_o = np.zeros((1, 10, 9), dtype=np.float32)
-    ba_s = np.zeros((1, 10, 9), dtype=np.float32)
-    ba_o = np.zeros((1, 10, 9), dtype=np.float32)
-    kray_s = np.zeros((1, 10, 9), dtype=np.float32)
-    kray_o = np.zeros((1, 10, 9), dtype=np.float32)
-    z1 = np.zeros((1, 10, 9), dtype=np.float32)
-    stm_counts: list[np.ndarray] = [z1] * 6
-    opp_counts: list[np.ndarray] = [z1] * 6
-
     lfa, ltb = _last_move_planes(last_move)
     lf[0] = lfa
     lt[0] = ltb
 
-    dens[0] = _board_density(boardarr)
-    pwn[0] = _pawn_progress_plane(boardarr)
+    ms, mo = _material_broadcast(boardarr, stm_side)
+    mstm, mopp = ms[np.newaxis, ...], mo[np.newaxis, ...]
+    maj_s = _major_ratio(boardarr, stm_side)[np.newaxis, ...]
+    maj_o = _major_ratio(boardarr, opp_side)[np.newaxis, ...]
+    cap_s = _capture_dst_union(boardarr, legal_iccs, red_to_move)[np.newaxis, ...]
+    cap_o = np.zeros((1, 10, 9), dtype=np.float32)
+    pwn = _pawn_progress_plane(boardarr)[np.newaxis, ...]
     kd, kr = _king_geometry(boardarr)
-    kdist[0] = kd
-    krank[0] = kr
+    kdist, krank = kd[np.newaxis, ...], kr[np.newaxis, ...]
+    dens = _board_density(boardarr)[np.newaxis, ...]
 
-    try:
-        cb = chess_board_from_base(board_state)
-        if cb.move_side is not None:
-            stm_side = cb.move_side
-            opp_side = ChessSide.next_side(stm_side)
-            stm_d[0] = _union_legal_move_destinations(cb, stm_side)
-            opp_d[0] = _union_legal_move_destinations(cb, opp_side)
-            ms, mo = _material_broadcast(boardarr, stm_side)
-            mstm[0] = ms
-            mopp[0] = mo
-            maj_s[0] = _major_ratio(boardarr, stm_side)
-            maj_o[0] = _major_ratio(boardarr, opp_side)
-            cap_s[0] = _capture_destination_union(cb, stm_side)
-            cap_o[0] = _capture_destination_union(cb, opp_side)
-            orook[0] = _piece_attack_union(cb, opp_side, PieceT.ROOK)
-            ocann[0] = _piece_attack_union(cb, opp_side, PieceT.CANNON)
-            oknight[0] = _piece_attack_union(cb, opp_side, PieceT.KNIGHT)
-            srook[0] = _piece_attack_union(cb, stm_side, PieceT.ROOK)
-            scann[0] = _piece_attack_union(cb, stm_side, PieceT.CANNON)
-            sknight[0] = _piece_attack_union(cb, stm_side, PieceT.KNIGHT)
+    zatk = np.zeros((1, 10, 9), dtype=np.float32)
+    orook = ocann = oknight = zatk
+    srook = _species_dst_union(boardarr, legal_iccs, PieceT.ROOK)[np.newaxis, ...]
+    scann = _species_dst_union(boardarr, legal_iccs, PieceT.CANNON)[np.newaxis, ...]
+    sknight = _species_dst_union(boardarr, legal_iccs, PieceT.KNIGHT)[np.newaxis, ...]
 
-            knei_s[0] = _king_ortho_neighbor_density(boardarr, stm_side)
-            knei_o[0] = _king_ortho_neighbor_density(boardarr, opp_side)
-            pcap_s[0] = _pawn_capture_only_union(cb, stm_side)
-            pcap_o[0] = _pawn_capture_only_union(cb, opp_side)
-            ba_s[0] = _bishop_advisor_union(cb, stm_side)
-            ba_o[0] = _bishop_advisor_union(cb, opp_side)
-            kray_s[0] = _king_cross_empty_rays(boardarr, stm_side)
-            kray_o[0] = _king_cross_empty_rays(boardarr, opp_side)
+    river = _river_band_plane()[np.newaxis, ...]
+    red_h, blk_h = _half_board_planes()
+    rh, bh = red_h[np.newaxis, ...], blk_h[np.newaxis, ...]
+    knei_s = _king_ortho_neighbor_density(boardarr, stm_side)[np.newaxis, ...]
+    knei_o = _king_ortho_neighbor_density(boardarr, opp_side)[np.newaxis, ...]
+    pcap_s = _pawn_capture_union(boardarr, legal_iccs, red_to_move)[np.newaxis, ...]
+    pcap_o = np.zeros((1, 10, 9), dtype=np.float32)
+    ba_s = _bishop_advisor_union(boardarr, legal_iccs, red_to_move)[np.newaxis, ...]
+    ba_o = np.zeros((1, 10, 9), dtype=np.float32)
+    kray_s = _king_cross_empty_rays(boardarr, stm_side)[np.newaxis, ...]
+    kray_o = _king_cross_empty_rays(boardarr, opp_side)[np.newaxis, ...]
 
-            den = (2.0, 2.0, 2.0, 2.0, 2.0, 5.0)
-            specs = (
-                PieceT.ROOK,
-                PieceT.KNIGHT,
-                PieceT.CANNON,
-                PieceT.BISHOP,
-                PieceT.ADVISOR,
-                PieceT.PAWN,
-            )
-            stm_counts = [
-                _species_count_broadcast(boardarr, stm_side, sp, d)[np.newaxis, ...]
-                for sp, d in zip(specs, den)
-            ]
-            opp_counts = [
-                _species_count_broadcast(boardarr, opp_side, sp, d)[np.newaxis, ...]
-                for sp, d in zip(specs, den)
-            ]
-    except Exception:
-        pass
+    den = (2.0, 2.0, 2.0, 2.0, 2.0, 5.0)
+    specs = (
+        PieceT.ROOK,
+        PieceT.KNIGHT,
+        PieceT.CANNON,
+        PieceT.BISHOP,
+        PieceT.ADVISOR,
+        PieceT.PAWN,
+    )
+    stm_counts = [_species_count_broadcast(boardarr, stm_side, sp, d)[np.newaxis, ...] for sp, d in zip(specs, den)]
+    opp_counts = [_species_count_broadcast(boardarr, opp_side, sp, d)[np.newaxis, ...] for sp, d in zip(specs, den)]
 
     return np.concatenate(
         [

@@ -1,4 +1,4 @@
-"""网页对弈（移植自 MyElephant ``play_policy_torch``：Flask + 前端棋盘；规则用 XQWL C++ 若可用）。"""
+"""网页对弈（Flask）；规则与特征均依赖 ``xqwl_core``。"""
 from __future__ import annotations
 
 import argparse
@@ -9,10 +9,9 @@ import numpy as np
 import torch
 
 from mycchess_rl.chess.features import parse_move_squares
+from mycchess_rl.chess.session import GamePlay
 from mycchess_rl.model import load_successor_policy_for_play
 from mycchess_rl.policy_inference import infer_greedy_move_string
-from mycchess_rl.rules_backend import make_rules_backend, sync_gameplay_from_fen
-from mycchess_rl.chess.session import GamePlay
 
 STRATEGY_HUMAN = "人类"
 STRATEGY_NEURAL = "纯网络"
@@ -51,16 +50,12 @@ def _select_device(gpu: int) -> torch.device:
 
 
 class XqwlWebSession:
-    """XQWL / Python 规则 + 与特征对齐的 ``GamePlay`` 镜像。"""
-
-    def __init__(self, model, device: torch.device, flist: dict, *, prefer_cpp: bool = True) -> None:
+    def __init__(self, model, device: torch.device, flist: dict) -> None:
         self._lock = threading.Lock()
         self.model = model
         self.device = device
         self.flist = flist
-        self.backend = make_rules_backend(prefer_cpp)
-        self.gp = GamePlay()
-        sync_gameplay_from_fen(self.gp, self.backend.fen())
+        self.game = GamePlay()
         self.sel_from: tuple[int, int] | None = None
         self.last_move: tuple[int, int, int, int] | None = None
         self.strategy_red = STRATEGY_NEURAL
@@ -69,30 +64,25 @@ class XqwlWebSession:
         self._ai_busy = False
 
     def _raw_board(self) -> np.ndarray:
-        return np.asarray(self.gp.bb._board[::-1])
+        return self.game.board_view()
 
     def _legal_strings(self) -> set[str]:
-        return set(self.backend.legal_iccs())
-
-    def _sync_from_backend(self) -> None:
-        sync_gameplay_from_fen(self.gp, self.backend.fen())
+        return set(self.game.legal_moves_iccs_str())
 
     def _apply_human_move(self, mv: str) -> None:
         if mv not in self._legal_strings():
             return
-        self.backend.make_iccs(mv)
-        self._sync_from_backend()
+        self.game.make_move_iccs(mv)
         x1, y1, x2, y2 = parse_move_squares(mv)
         self.last_move = (x1, y1, x2, y2)
-        self.gp._last_move_iccs = mv  # noqa: SLF001
         self._check_terminal()
 
     def _check_terminal(self) -> None:
-        t, r = self.backend.terminal()
+        t, r = self.game.terminal()
         if not t:
             return
         if r == "checkmate":
-            stm = "红方" if self.backend.side_red_to_move() else "黑方"
+            stm = "红方" if self.game.red_to_move else "黑方"
             self._toasts.append({"kind": "info", "title": "终局", "body": f"{stm} 被将死。"})
         else:
             self._toasts.append({"kind": "info", "title": "终局", "body": r})
@@ -111,7 +101,7 @@ class XqwlWebSession:
                         s = str(ch)
                         row.append({"ch": s, "side": _piece_side(s), "label": _PIECE_CHAR.get(s, "?")})
                 rows.append(row)
-            side = "red" if self.backend.side_red_to_move() else "black"
+            side = self.game.get_side()
             return {
                 "board": rows,
                 "visual_sig": "|".join(str(arr[iy, ix] or ".") for iy in range(10) for ix in range(9)),
@@ -142,11 +132,9 @@ class XqwlWebSession:
 
     def new_game(self) -> dict | None:
         with self._lock:
-            self.backend.reset()
-            self._sync_from_backend()
+            self.game.reset()
             self.sel_from = None
             self.last_move = None
-            self.gp._last_move_iccs = None  # noqa: SLF001
         self.maybe_ai()
         return None
 
@@ -154,7 +142,7 @@ class XqwlWebSession:
         with self._lock:
             if self._ai_busy:
                 return {"error": "AI 思考中"}
-            side = "red" if self.backend.side_red_to_move() else "black"
+            side = self.game.get_side()
             strat = self.strategy_red if side == "red" else self.strategy_black
             if strat != STRATEGY_HUMAN:
                 return {"error": "当前非人类行棋"}
@@ -183,23 +171,21 @@ class XqwlWebSession:
         with self._lock:
             if self._ai_busy:
                 return
-            side = "red" if self.backend.side_red_to_move() else "black"
+            side = self.game.get_side()
             strat = self.strategy_red if side == "red" else self.strategy_black
             if strat != STRATEGY_NEURAL:
                 return
-            if self.backend.terminal()[0]:
+            if self.game.terminal()[0]:
                 return
-            if not self.backend.legal_iccs():
+            if not self.game.legal_moves_iccs_str():
                 return
             self._ai_busy = True
             model, device, flist = self.model, self.device, self.flist
-            gp_snap = GamePlay()
-            sync_gameplay_from_fen(gp_snap, self.backend.fen())
-            gp_snap._last_move_iccs = self.gp._last_move_iccs  # noqa: SLF001
+            g_copy = self.game.copy()
 
         def worker() -> None:
             try:
-                mv = infer_greedy_move_string(gp_snap, model, device, flist)
+                mv = infer_greedy_move_string(g_copy, model, device, flist)
             except Exception as e:
                 with self._lock:
                     self._ai_busy = False
@@ -217,7 +203,6 @@ class XqwlWebSession:
 
 
 def _html_page() -> str:
-    # 自 MyElephant play_policy_torch 精简：仅人类 / 纯网络；标题与文案改为 MyCChessRL
     return """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -359,12 +344,11 @@ def main() -> None:
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--no-cpp", action="store_true")
     args = p.parse_args()
 
     device = _select_device(int(args.gpu))
     model, flist = load_successor_policy_for_play(args.checkpoint, device)
-    session = XqwlWebSession(model, device, flist, prefer_cpp=not args.no_cpp)
+    session = XqwlWebSession(model, device, flist)
 
     app = Flask(__name__)
 

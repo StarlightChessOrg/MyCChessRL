@@ -23,4 +23,4 @@ mycchess-play-web = "mycchess_rl.play_web:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mycchess_rl*", "cchess*"]
+include = ["mycchess_rl*"]

@@ -160,6 +160,13 @@ struct XQWLPosition {
   std::string fen() const { return position_to_fen(pos); }
 
   int side_to_move() const { return pos.sdPlayer; }
+
+  /** 深拷贝局面（供多线程 AI 推理等） */
+  XQWLPosition copy() const {
+    XQWLPosition q;
+    q.pos = pos;
+    return q;
+  }
 };
 
 PYBIND11_MODULE(xqwl_core, m) {
@@ -181,7 +188,8 @@ PYBIND11_MODULE(xqwl_core, m) {
       .def("is_mate", &XQWLPosition::is_mate)
       .def("terminal_kind", &XQWLPosition::terminal_kind)
       .def("fen", &XQWLPosition::fen)
-      .def("side_to_move", &XQWLPosition::side_to_move);
+      .def("side_to_move", &XQWLPosition::side_to_move)
+      .def("copy", &XQWLPosition::copy);
 
   m.attr("MATE_VALUE") = MATE_VALUE;
   m.attr("BAN_VALUE") = BAN_VALUE;

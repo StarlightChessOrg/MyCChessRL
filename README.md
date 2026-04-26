@@ -1,72 +1,57 @@
 # MyCChessRL
 
-本仓库汇总「象棋小巫师」**XQWL06** 中的局面与棋规逻辑、**pybind11** 扩展、与 **MyElephant / icyElephant** 对齐的 **PyTorch 两阶段策略网络**、**并行环境 PPO 自对弈**示意实现，以及自 **MyElephant** 移植的 **Flask 网页对弈 UI**（人类 vs 纯网络）。
+中国象棋强化学习实践：**规则与合法着法仅通过本地编译的 `xqwl_core`（象棋小巫师 XQWL06 核心）提供**，不依赖 `cchess` 或其它 Python 棋规库。神经网络为与 MyElephant 一致的 **两阶段 ICCS 策略 + 行棋方三分类价值头**；特征平面在纯 NumPy 路径下由当前 FEN 与 **当前方合法 ICCS 列表** 计算。
 
-## 工作区中其它目录
+## 依赖
 
-| 目录 | 作用 |
-|------|------|
-| `象棋小巫师/` | 原始 XQWL06.CPP 源码与文档 |
-| `pybind11-master/` | CMake 默认识别的 pybind11 源码路径（与 `MyCChessRL/cpp/CMakeLists.txt` 相对） |
-| `MyElephant/` | 特征工程、网页对弈、训练代码来源 |
-| `icyElephant/` | 早期 notebook 流程参考（本仓库网络结构以 MyElephant `SuccessorPolicy` 为准） |
+- **Python**：≥ 3.10  
+- **NumPy、PyTorch**：见 `requirements.txt` 或与 `pyproject.toml` 同步。  
+- **`xqwl_core`**：C++17 扩展（pybind11），**必须**自行编译并加入 `PYTHONPATH` 或安装到当前环境。训练、并行环境与对弈等入口在导入 `mycchess_rl.xqwl_state` 时需要该模块；仅使用 `mycchess_rl.chess` 等纯 NumPy 子模块可不装。  
+- **网页对弈**：`flask`（`pip install -r requirements.txt` 或 `pip install -e ".[play]"`）。
 
-## C++ 扩展 `xqwl_core`
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
 
-- **抽离内容**：自 `象棋小巫师/XQWL06.CPP` 第 64–1069 行（常量、Zobrist、局面结构、`GenerateMoves` / `LegalMove` / `MakeMove` / `RepStatus` / `RepValue` / `IsMate` 等），去掉 Windows / 搜索 / UI；**自然限着**与原版 UI 一致：`nMoveNum > 100` 判和。
-- **重复与「长打」**：与原版相同的 `RepStatus` / `RepValue` 与 `BAN_VALUE` 刻度（界面文案称「长打」；实现上基于无吃子回退链上的 **反复将军** 标志位，与商业棋规中的「长捉」细则并不完全等价）。
-- **生成文件**：`cpp/xqwl_extract.inc` 可由同路径下源文件重新截取（见下节）。
+## 编译 `xqwl_core`
 
-### 编译（需本机已安装 CMake、C++17 编译器、Python 开发头文件）
+源码抽离自 `象棋小巫师/XQWL06.CPP`（`cpp/xqwl_extract.inc`），CMake 默认使用工作区内的 `pybind11-master`。
 
-```powershell
-cd MyCChessRL\cpp\build
-cmake .. -DPython_EXECUTABLE=(Get-Command python).Source
+```text
+cd MyCChessRL/cpp/build
+cmake .. -DPython_EXECUTABLE=python
 cmake --build . --config Release
 ```
 
-将生成的 `xqwl_core.cp310-win_amd64.pyd`（名称随 Python 版本变化）复制到 `mycchess_rl` 包同级的 `site-packages` 或把 `build/Release` 加入 `PYTHONPATH`。未编译时 Python 端自动回退到 `cchess` 的 `GamePlay` 规则（重复/限着较弱）。
+将生成的 `xqwl_core*.pyd` / `xqwl_core*.so` 放到可被 Python 导入的路径。
 
-### 重新生成 `xqwl_extract.inc`
+`Position` 提供 `reset`、`legal_moves_iccs`、`make_move_iccs`、`fen`、`in_check`、`terminal_kind`、`copy`（局面快照）等接口。
 
-若升级了 `XQWL06.CPP`，可在 PowerShell 中执行：
+## 项目结构（概要）
 
-```powershell
-$lines = Get-Content "..\象棋小巫师\XQWL06.CPP" -Encoding UTF8
-$lines[63..1068] | Set-Content "MyCChessRL\cpp\xqwl_extract.inc" -Encoding UTF8
+| 路径 | 说明 |
+|------|------|
+| `cpp/` | `xqwl_core` CMake 与绑定 |
+| `mycchess_rl/xqwl_state.py` | `XqwlGameState`：唯一规则入口 |
+| `mycchess_rl/chess/` | 平面编码（无 cchess） |
+| `mycchess_rl/model.py` | `SuccessorPolicy` 与 checkpoint 加载 |
+| `mycchess_rl/policy_inference.py` | 贪心 / 批采样 / 价值 / PPO 用 `log π` |
+| `mycchess_rl/vec_env.py` | 并行环境步进 |
+| `mycchess_rl/train_ppo.py` | PPO 示意训练 |
+| `mycchess_rl/play_web.py` | Flask 网页对弈 |
+
+## 训练与对弈
+
+```bash
+python -m mycchess_rl.train_ppo --n-env 32 --steps 64 --updates 100
+mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8765
 ```
 
-## Python 包安装
+## 特征说明
 
-```powershell
-cd MyCChessRL
-pip install -e .
-pip install -e ".[play]"   # 网页对弈需要 Flask
-```
-
-顶层 **`cchess`** 与 **`mycchess_rl`** 并列安装，以保持与原版相同的 `import cchess`。
-
-## 模型与特征
-
-- **网络**：`mycchess_rl.model.SuccessorPolicy` — 与 MyElephant `policy_torch` 相同：`stem` + `num_res_layers` 个 `ResBlock` + 全局池化；**`head_src` / `head_dst` / `value_head(3 类)`**。
-- **输入平面**：自 MyElephant 拷贝的 `mycchess_rl.chess`（`encode_model_planes`：7 路有符号子力 + 11 路理据 + `plane_extras` 等），通道数 **`POLICY_SELECT_IN_CHANNELS`**。
-- **推理辅助**：`mycchess_rl.policy_inference`（贪心两阶段、批采样、价值期望、旧策略 `log π`）。
-
-## PPO 与并行环境
-
-- **环境**：`mycchess_rl.vec_env.ParallelXiangqiVecEnv` — 每步对所有槽位并行走一步；终局槽位在 `reset_finished` 中重置。
-- **训练入口**：`python -m mycchess_rl.train_ppo`（或 `mycchess-train-ppo`）。当前实现为**示意**（短 horizon、简化回报与数值稳定裁剪），便于在此基础上加长 rollout、加熵/学习率调度、分离 critic 等。
-
-主要参数：`--n-env`、`--steps`、`--updates`、`--checkpoint`、`--no-cpp`。
-
-## 网页对弈
-
-```powershell
-mycchess-play-web --checkpoint path\to\best.pt --host 0.0.0.0 --port 8765
-```
-
-红/黑可选「人类」「纯网络」（贪心两阶段）。规则默认走 **XQWL C++**（若扩展已安装）。
+部分「对方着法并集 / 对方吃子目标」等平面在无对方独立引擎枚举时填 **零**，通道维数仍为 **7 + 11 + 47**，与旧 checkpoint 形状兼容；若需完全复刻 MyElephant 数值，可后续在 `xqwl_core` 中增加「指定行棋方生成合法着」接口再接通。
 
 ## 许可证
 
-原 XQWL、cchess、MyElephant 各自版权与许可证请以原项目为准；本仓库新增代码见 `LICENSE`。
+原 XQWL、MyElephant 等各自版权与许可证以原项目为准；本仓库见 `LICENSE`。
