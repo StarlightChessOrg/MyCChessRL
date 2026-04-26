@@ -64,7 +64,7 @@ def _ensure_pool(workers: int) -> ProcessPoolExecutor:
     if _pool is not None:
         _pool.shutdown(wait=True, cancel_futures=False)
         _pool = None
-    _pool = _mp_ctx.ProcessPoolExecutor(max_workers=w)
+    _pool = ProcessPoolExecutor(max_workers=w, mp_context=_mp_ctx)
     _pool_workers = w
     return _pool
 
