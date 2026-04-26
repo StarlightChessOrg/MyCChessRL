@@ -61,29 +61,53 @@ def policy_value_loss_step(
     ret_value: torch.Tensor,
     old_v: torch.Tensor,
     cfg: PPOConfig,
-) -> float:
+) -> tuple[float, dict[str, float]]:
     model.train()
     logits_s, logits_d, logits_v = model(obs, src_oh)
     logp_s = (F.log_softmax(logits_s, dim=1) * src_oh).sum(dim=1)
     logp_d = (F.log_softmax(logits_d, dim=1) * dst_oh).sum(dim=1)
     logp = torch.clamp(logp_s + logp_d, -80.0, 0.0)
-    old_logp = torch.clamp(old_logp, -80.0, 0.0)
-    ratio = torch.exp(torch.clamp(logp - old_logp, -5.0, 5.0))
+    old_logp_c = torch.clamp(old_logp, -80.0, 0.0)
+    ratio = torch.exp(torch.clamp(logp - old_logp_c, -5.0, 5.0))
     ratio = torch.clamp(ratio, 0.0, 32.0)
     surr1 = ratio * adv
     surr2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * adv
     pol_loss = -torch.min(surr1, surr2).mean()
     v_pred = value_expectation_from_logits(logits_v)
     v_loss = F.smooth_l1_loss(v_pred, ret_value, beta=0.5)
-    ent = (-(F.softmax(logits_s, 1) * F.log_softmax(logits_s, 1)).sum(1)).mean() + (
-        -(F.softmax(logits_d, 1) * F.log_softmax(logits_d, 1)).sum(1)
-    ).mean()
+    ent_s = (-(F.softmax(logits_s, 1) * F.log_softmax(logits_s, 1)).sum(1)).mean()
+    ent_d = (-(F.softmax(logits_d, 1) * F.log_softmax(logits_d, 1)).sum(1)).mean()
+    ent = ent_s + ent_d
     loss = pol_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent
     opt.zero_grad()
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
     opt.step()
-    return float(loss.detach().cpu())
+
+    clip_lo, clip_hi = 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps
+    clip_frac = ((ratio < clip_lo) | (ratio > clip_hi)).float().mean()
+    approx_kl = (old_logp_c - logp).mean()
+    with torch.no_grad():
+        metrics: dict[str, float] = {
+            "loss_total": float(loss.detach().cpu()),
+            "loss_policy": float(pol_loss.detach().cpu()),
+            "loss_value": float(v_loss.detach().cpu()),
+            "loss_vf_weighted": float((cfg.vf_coef * v_loss).detach().cpu()),
+            "entropy_sum": float(ent.detach().cpu()),
+            "entropy_src": float(ent_s.detach().cpu()),
+            "entropy_dst": float(ent_d.detach().cpu()),
+            "ratio_mean": float(ratio.mean().cpu()),
+            "ratio_std": float(ratio.std(unbiased=False).cpu()) if ratio.numel() > 1 else 0.0,
+            "clip_frac": float(clip_frac.cpu()),
+            "approx_kl": float(approx_kl.cpu()),
+            "grad_norm": float(
+                grad_norm.detach().cpu() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            ),
+            "batch": float(obs.shape[0]),
+            "v_pred_mean": float(v_pred.mean().cpu()),
+            "old_v_mean": float(old_v.mean().cpu()),
+        }
+    return float(loss.detach().cpu()), metrics
 
 
 def iccs_to_src_dst_onehot(iccs: str, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
