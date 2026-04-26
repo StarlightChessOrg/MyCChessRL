@@ -45,7 +45,7 @@ cmake --build . --config Release
 
 ```bash
 python -m mycchess_rl.train_ppo
-mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8765
+mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 ```
 
 默认训练超参面向 **约 24 核 CPU、64GB 内存、单卡 A100 40GB**（例如 `--n-env 192 --steps 128 --updates 800`），可按机器再调。

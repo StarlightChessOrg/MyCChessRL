@@ -344,7 +344,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="MyCChessRL 网页对弈（Sanic）")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--host", type=str, default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--port", type=int, default=8080)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--workers", type=int, default=1, help="Sanic worker 数（>1 时勿依赖本进程内单会话）")
     args = p.parse_args()
