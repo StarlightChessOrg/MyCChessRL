@@ -11,7 +11,11 @@ import numpy as np
 import torch
 
 from mycchess_rl.model import SuccessorPolicy, load_successor_policy_for_play
-from mycchess_rl.policy_inference import batched_encode_roots, batched_value_expectation, two_stage_logprob_on_move
+from mycchess_rl.policy_inference import (
+    batched_encode_roots,
+    batched_two_stage_logprob_on_moves,
+    batched_value_expectation,
+)
 from mycchess_rl.ppo import PPOConfig, compute_gae, iccs_to_src_dst_onehot, policy_value_loss_step
 from mycchess_rl.vec_env import ParallelXiangqiVecEnv, collect_rollout_step, reset_finished
 
@@ -79,6 +83,12 @@ def main() -> None:
         default=None,
         help="额外写入该路径（UTF-8）；与控制台相同内容",
     )
+    p.add_argument(
+        "--rollout-log-every",
+        type=int,
+        default=32,
+        help="rollout 内每隔多少 timestep 打一条进度（0=关闭）",
+    )
     args = p.parse_args()
 
     _setup_logging(args.log_file)
@@ -126,9 +136,17 @@ def main() -> None:
     N = args.n_env
     gen = torch.Generator(device=device)
     log_every = max(1, int(args.log_every))
+    roll_log = int(args.rollout_log_every)
 
     for upd in range(args.updates):
         t_upd0 = time.perf_counter()
+        _LOG.info(
+            "[ppo] update %d/%d 开始 | rollout 共 %d 步 × %d 环境",
+            upd,
+            args.updates,
+            T,
+            N,
+        )
         obs_buf: list[list[object]] = [[None] * N for _ in range(T)]
         act_buf = np.empty((T, N), dtype=object)
         rew_buf = np.zeros((T, N), dtype=np.float32)
@@ -162,6 +180,16 @@ def main() -> None:
                 v_cur = batched_value_expectation([s.game for s in vec.slots], model, device, flist)
                 v_cur = v_cur.detach().float().cpu().numpy()
             reset_finished(vec, done)
+
+            if roll_log > 0 and (t + 1) % roll_log == 0:
+                _LOG.info(
+                    "[ppo] update %d rollout 进度 %d/%d (%.0f%%) elapsed=%.1fs",
+                    upd,
+                    t + 1,
+                    T,
+                    100.0 * (t + 1) / T,
+                    time.perf_counter() - t_roll0,
+                )
 
         t_roll1 = time.perf_counter()
         rollout_s = t_roll1 - t_roll0
@@ -204,23 +232,34 @@ def main() -> None:
             continue
 
         t_opt0 = time.perf_counter()
+        _LOG.info(
+            "[ppo] update %d 优化阶段 | 有效样本=%d / slots=%d | 编码+batch trunk...",
+            upd,
+            len(obs_list),
+            slots_total,
+        )
         xb = batched_encode_roots(obs_list, flist, device)
         with torch.no_grad():
             model.eval()
             feat_roll = model._trunk_flat(xb)
-            old_lp_rows: list[float] = []
-            for fi in range(feat_roll.shape[0]):
-                lp = two_stage_logprob_on_move(
-                    obs_list[fi],
-                    model,
-                    device,
-                    flist,
-                    mv_list[fi],
-                    policy_temperature=1.0,
-                    feat_1_row=feat_roll[fi : fi + 1],
-                )
-                old_lp_rows.append(float(lp.cpu()))
-        old_lp = torch.tensor(old_lp_rows, device=device, dtype=torch.float32)
+            _LOG.info(
+                "[ppo] update %d 计算 old_logp（整批 head，样本数=%d）...",
+                upd,
+                feat_roll.shape[0],
+            )
+            old_lp = batched_two_stage_logprob_on_moves(
+                obs_list,
+                mv_list,
+                feat_roll,
+                model,
+                device,
+                policy_temperature=1.0,
+            )
+        _LOG.info(
+            "[ppo] update %d old_logp 完成 elapsed=%.2fs，开始反向更新",
+            upd,
+            time.perf_counter() - t_opt0,
+        )
 
         src_b = torch.stack(src_list, dim=0)
         dst_b = torch.stack(dst_list, dim=0)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from mycchess_rl.chess.features import encode_model_planes
 from mycchess_rl.chess.rationale import (
@@ -183,6 +184,54 @@ def two_stage_logprob_on_move(
             dst_mask[d * 9 + c] = True
     log_p_dst = torch.log_softmax((ld / T).masked_fill(~dst_mask, -1e9), dim=0)
     return log_p_src[src_i] + log_p_dst[dst_i]
+
+
+@torch.no_grad()
+def batched_two_stage_logprob_on_moves(
+    obs_list: list[XqwlGameState],
+    mv_list: list[str],
+    feat_b: torch.Tensor,
+    model: SuccessorPolicy,
+    device: torch.device,
+    *,
+    policy_temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    与逐条 ``two_stage_logprob_on_move`` 等价，但 ``head_src`` / ``head_dst`` 为整批矩阵算子，
+    避免数万次 Python 循环导致长时间无日志、极慢。
+    """
+    T = policy_temperature_scalar(policy_temperature)
+    B = feat_b.shape[0]
+    if B == 0:
+        return torch.zeros(0, device=device, dtype=torch.float32)
+
+    logits_s = model.head_src(feat_b)
+    src_idx = torch.zeros(B, dtype=torch.long, device=device)
+    dst_idx = torch.zeros(B, dtype=torch.long, device=device)
+    src_ok = torch.zeros(B, POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
+    dst_ok = torch.zeros(B, POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
+    oh_s = torch.zeros(B, POLICY_GRID_NUMEL, device=device, dtype=feat_b.dtype)
+
+    for i, (g, mv) in enumerate(zip(obs_list, mv_list)):
+        x1, y1, x2, y2 = int(mv[0]), int(mv[1]), int(mv[3]), int(mv[4])
+        src_idx[i] = y1 * 9 + x1
+        dst_idx[i] = y2 * 9 + x2
+        oh_s[i, src_idx[i]] = 1.0
+        for a, b, _, _ in sorted(g.legal_moves_iccs()):
+            src_ok[i, b * 9 + a] = True
+        for a, b, c, d in sorted(g.legal_moves_iccs()):
+            if (a, b) == (x1, y1):
+                dst_ok[i, d * 9 + c] = True
+
+    scaled_s = logits_s / T
+    log_p_s = F.log_softmax(scaled_s.masked_fill(~src_ok, -1e9), dim=1)
+    log_p_s = log_p_s.gather(1, src_idx.unsqueeze(1)).squeeze(1)
+
+    logits_d = model.head_dst(torch.cat([feat_b, oh_s], dim=1))
+    scaled_d = logits_d / T
+    log_p_d = F.log_softmax(scaled_d.masked_fill(~dst_ok, -1e9), dim=1)
+    log_p_d = log_p_d.gather(1, dst_idx.unsqueeze(1)).squeeze(1)
+    return log_p_s + log_p_d
 
 
 @torch.no_grad()
