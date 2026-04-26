@@ -91,10 +91,18 @@ def main() -> None:
         help="rollout 内每隔多少 timestep 打一条进度（0=关闭）",
     )
     p.add_argument(
+        "--encode-backend",
+        type=str,
+        choices=("inline", "thread", "process"),
+        default="inline",
+        help="根平面编码：inline=主进程批 numpy+单次 H2D（rollout 默认，避免进程 IPC 拖 GPU）；"
+        "thread/process 时用 --encode-workers",
+    )
+    p.add_argument(
         "--encode-workers",
         type=int,
         default=None,
-        help="CPU 特征编码进程池 worker 数；省略则 min(8, CPU核数)；1=主进程内顺序编码（不用进程池）",
+        help="仅 encode-backend 为 thread/process 时生效；并行 worker 数，省略则 min(8, CPU核数)；1=退化为单 worker",
     )
     p.add_argument(
         "--ppo-mini-batch",
@@ -106,6 +114,7 @@ def main() -> None:
 
     _setup_logging(args.log_file)
     enc_w = default_encode_workers() if args.encode_workers is None else int(args.encode_workers)
+    enc_be = str(args.encode_backend).strip().lower()
 
     device = torch.device("cpu")
     if args.gpu >= 0 and torch.cuda.is_available():
@@ -141,7 +150,8 @@ def main() -> None:
         name = torch.cuda.get_device_name(idx)
         _LOG.info("CUDA 设备: [%d] %s", idx, name)
     _LOG.info(
-        "特征编码 encode_workers(进程池)=%d | PPO mini-batch=%d",
+        "特征编码 backend=%s encode_workers=%d（仅 thread/process）| PPO mini-batch=%d",
+        enc_be,
         enc_w,
         int(args.ppo_mini_batch),
     )
@@ -175,7 +185,12 @@ def main() -> None:
         t_roll0 = time.perf_counter()
         with torch.no_grad():
             v_cur = batched_value_expectation(
-                [s.game for s in vec.slots], model, device, flist, encode_workers=enc_w
+                [s.game for s in vec.slots],
+                model,
+                device,
+                flist,
+                encode_workers=enc_w,
+                encode_backend=enc_be,
             )
             v_cur = v_cur.detach().float().cpu().numpy()
 
@@ -196,6 +211,7 @@ def main() -> None:
                 policy_temperature=1.0,
                 generator=gen,
                 encode_workers=enc_w,
+                encode_backend=enc_be,
             )
             act_buf[t, :] = moves
             rew_buf[t] = rew
@@ -205,7 +221,12 @@ def main() -> None:
 
             with torch.no_grad():
                 v_cur = batched_value_expectation(
-                    [s.game for s in vec.slots], model, device, flist, encode_workers=enc_w
+                    [s.game for s in vec.slots],
+                    model,
+                    device,
+                    flist,
+                    encode_workers=enc_w,
+                    encode_backend=enc_be,
                 )
                 v_cur = v_cur.detach().float().cpu().numpy()
             reset_finished(vec, done)
@@ -225,7 +246,12 @@ def main() -> None:
 
         with torch.no_grad():
             last_v = batched_value_expectation(
-                [s.game for s in vec.slots], model, device, flist, encode_workers=enc_w
+                [s.game for s in vec.slots],
+                model,
+                device,
+                flist,
+                encode_workers=enc_w,
+                encode_backend=enc_be,
             )
             last_v = last_v.detach().float().cpu().numpy()
         adv, ret = compute_gae(rew_buf, val_buf, done_buf, last_v, gamma=cfg.gamma, lam=cfg.gae_lambda)
@@ -269,7 +295,13 @@ def main() -> None:
             len(obs_list),
             slots_total,
         )
-        xb = batched_encode_roots(obs_list, flist, device, encode_workers=enc_w)
+        xb = batched_encode_roots(
+            obs_list,
+            flist,
+            device,
+            encode_workers=enc_w,
+            encode_backend=enc_be,
+        )
         with torch.no_grad():
             model.eval()
             feat_roll = model._trunk_flat(xb)

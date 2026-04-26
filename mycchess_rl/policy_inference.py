@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from mycchess_rl.chess.features import encode_model_planes
+from mycchess_rl.iccs_util import parse_move_squares
 from mycchess_rl.chess.rationale import (
     POLICY_GRID_NUMEL,
     STM_VALUE_TERMINAL_DRAW,
@@ -13,6 +14,14 @@ from mycchess_rl.chess.rationale import (
 )
 from mycchess_rl.model import SuccessorPolicy, policy_temperature_scalar
 from mycchess_rl.xqwl_state import XqwlGameState
+
+
+def _legal_moves_sorted_tuples(st: XqwlGameState) -> list[tuple[int, int, int, int]]:
+    """单次 ``legal_moves_iccs_str`` + Python 解析，避免 ``legal_moves_iccs`` 再调 C++ 生成一遍。"""
+    ms = st.legal_moves_iccs_str()
+    if not ms:
+        return []
+    return sorted(parse_move_squares(m) for m in ms)
 
 
 def _encode_state_current_nchw(state: XqwlGameState, flist: dict[str, list[str]], device: torch.device) -> torch.Tensor:
@@ -101,16 +110,34 @@ def batched_encode_roots(
     device: torch.device,
     *,
     encode_workers: int = 1,
+    encode_backend: str = "inline",
 ) -> torch.Tensor:
+    """根平面批编码。默认 ``inline``：主进程批量 numpy + **一次** H2D，最适合轻量 14 平面与 rollout 高频小批。"""
     if not states:
         return torch.zeros(0, device=device)
-    from mycchess_rl.encode_parallel import encode_states_parallel, resolve_encode_workers
+    from mycchess_rl.encode_parallel import (
+        encode_states_inline,
+        encode_states_process_pool,
+        encode_states_thread_pool,
+        resolve_encode_workers,
+    )
+
+    backend = (encode_backend or "inline").strip().lower()
+    if backend not in ("inline", "thread", "process"):
+        backend = "inline"
+
+    if backend == "inline":
+        chw = encode_states_inline(states)
+        return torch.from_numpy(np.ascontiguousarray(chw)).to(device, non_blocking=True)
 
     w = resolve_encode_workers(encode_workers, len(states))
     if w <= 1:
-        xs = [_encode_state_current_nchw(g, flist, device) for g in states]
-        return torch.cat(xs, dim=0)
-    chw = encode_states_parallel(states, w)
+        chw = encode_states_inline(states)
+        return torch.from_numpy(np.ascontiguousarray(chw)).to(device, non_blocking=True)
+    if backend == "thread":
+        chw = encode_states_thread_pool(states, w)
+    else:
+        chw = encode_states_process_pool(states, w)
     return torch.from_numpy(np.ascontiguousarray(chw)).to(device, non_blocking=True)
 
 
@@ -124,6 +151,7 @@ def batched_sample_moves_masked(
     policy_temperature: float = 1.0,
     generator: torch.Generator | None = None,
     encode_workers: int = 1,
+    encode_backend: str = "inline",
 ) -> list[str]:
     """整批 trunk + 批量 ``head_dst``，避免逐环境 B 次小矩阵乘。"""
     T = policy_temperature_scalar(policy_temperature)
@@ -132,19 +160,26 @@ def batched_sample_moves_masked(
     if B == 0:
         return []
 
-    has_legal_list = [bool(st.legal_moves_iccs_str()) for st in states]
+    legals_t = [_legal_moves_sorted_tuples(st) for st in states]
+    has_legal_list = [bool(lt) for lt in legals_t]
     has_legal = torch.tensor(has_legal_list, dtype=torch.bool, device=device)
 
-    xb = batched_encode_roots(states, flist, device, encode_workers=encode_workers)
+    xb = batched_encode_roots(
+        states,
+        flist,
+        device,
+        encode_workers=encode_workers,
+        encode_backend=encode_backend,
+    )
     feat_b = model._trunk_flat(xb)
     ls_b = model.head_src(feat_b)
     scaled_s = ls_b / T
 
     src_ok = torch.zeros(B, POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
-    for bi, st in enumerate(states):
-        if not has_legal_list[bi]:
+    for bi, lt in enumerate(legals_t):
+        if not lt:
             continue
-        for x1, y1, _, _ in sorted(st.legal_moves_iccs()):
+        for x1, y1, _, _ in lt:
             src_ok[bi, y1 * 9 + x1] = True
 
     logits_s = scaled_s.masked_fill(~src_ok, -1e9)
@@ -163,11 +198,11 @@ def batched_sample_moves_masked(
     dst_ok = torch.zeros(B, POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
     sx_all = (src_idx % 9).tolist()
     sy_all = (src_idx // 9).tolist()
-    for bi, st in enumerate(states):
-        if not has_legal_list[bi]:
+    for bi, lt in enumerate(legals_t):
+        if not lt:
             continue
         sx, sy = int(sx_all[bi]), int(sy_all[bi])
-        for x1, y1, x2, y2 in sorted(st.legal_moves_iccs()):
+        for x1, y1, x2, y2 in lt:
             if (x1, y1) == (sx, sy):
                 dst_ok[bi, y2 * 9 + x2] = True
 
@@ -289,6 +324,7 @@ def batched_value_expectation(
     flist: dict[str, list[str]],
     *,
     encode_workers: int = 1,
+    encode_backend: str = "inline",
 ) -> torch.Tensor:
     """单次 ``_trunk_flat`` 批前向，避免逐环境调用 ``eval_value_stm`` 导致 GPU 吃不饱。"""
     n = len(states)
@@ -309,7 +345,13 @@ def batched_value_expectation(
             active_states.append(g)
     if active_states:
         model.eval()
-        xb = batched_encode_roots(active_states, flist, device, encode_workers=encode_workers)
+        xb = batched_encode_roots(
+            active_states,
+            flist,
+            device,
+            encode_workers=encode_workers,
+            encode_backend=encode_backend,
+        )
         feat = model._trunk_flat(xb)
         logits_v = model.value_head(feat)
         vals = _scalar_value_from_logits_v(logits_v)

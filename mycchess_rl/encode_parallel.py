@@ -1,30 +1,35 @@
-"""常驻进程池 CPU 特征编码，加速 ``batched_encode_roots`` 数据准备。
+"""根平面 CPU 编码：支持 inline / 线程池 / 进程池。
 
-使用 ``multiprocessing`` 的 **spawn** 上下文创建子进程，避免主进程已初始化 CUDA 时 **fork** 带来的未定义行为。纯 NumPy/棋面编码受 GIL 限制，多线程难以提速；多进程可并行占用多核。
+``encode_model_planes`` 本身很轻（少量 NumPy），**默认 inline** 在主进程内批量
+``np.stack`` 后一次拷到 GPU，避免进程池在「每步 × 两路前向」场景下的 **pickle/IPC**
+反压 GPU。需要压榨多核且编码变重时可用 ``thread``；与 CUDA 共存且坚持子进程隔离时用
+``process``（``spawn`` + ``ProcessPoolExecutor``）。
 """
 from __future__ import annotations
 
 import atexit
 import multiprocessing as mp
 import os
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
 
-# 与已初始化 CUDA 的训练主进程共存时，spawn 比默认 fork 更安全。
 _mp_ctx = mp.get_context("spawn")
-_pool: ProcessPoolExecutor | None = None
-_pool_workers: int = 0
+_proc_pool: ProcessPoolExecutor | None = None
+_proc_pool_workers: int = 0
+
+_thread_pool: ThreadPoolExecutor | None = None
+_thread_pool_workers: int = 0
 
 
 def default_encode_workers() -> int:
-    """训练脚本与 ``collect_rollout_step`` 的默认并行编码进程数。"""
+    """并行编码（仅 thread/process 后端）的默认 worker 数。"""
     return max(2, min(8, os.cpu_count() or 4))
 
 
 def pack_planes_state(state: Any) -> tuple:
-    """从 ``XqwlGameState`` 拆出纯数据副本，供子进程编码（避免与主进程共享可变棋盘视图）。"""
+    """从 ``XqwlGameState`` 拆出纯数据副本，供子线程/子进程编码。"""
     return (
         np.array(state.board_view(), dtype="<U1", copy=True),
         bool(state.red_to_move),
@@ -48,50 +53,90 @@ def encode_packed_planes(packed: tuple) -> np.ndarray:
     return np.ascontiguousarray(cur_chw.astype(np.float32, copy=False))
 
 
+def encode_states_inline(states: list[Any]) -> np.ndarray:
+    """主进程顺序编码；``np.stack`` 后由调用方一次 ``.to(device)``。"""
+    if not states:
+        return np.zeros((0, 0, 0, 0), dtype=np.float32)
+    planes = [encode_packed_planes(pack_planes_state(g)) for g in states]
+    return np.stack(planes, axis=0)
+
+
 def _map_chunksize(n_items: int, n_workers: int) -> int:
-    """加大 chunksize 减少进程间 pickle/IPC 次数（大批次训练很重要）。"""
     if n_items <= 0:
         return 1
     w = max(1, n_workers)
     return max(1, n_items // (w * 8))
 
 
-def _ensure_pool(workers: int) -> ProcessPoolExecutor:
-    global _pool, _pool_workers
+def _ensure_proc_pool(workers: int) -> ProcessPoolExecutor:
+    global _proc_pool, _proc_pool_workers
     w = max(1, int(workers))
-    if _pool is not None and _pool_workers == w:
-        return _pool
-    if _pool is not None:
-        _pool.shutdown(wait=True, cancel_futures=False)
-        _pool = None
-    _pool = ProcessPoolExecutor(max_workers=w, mp_context=_mp_ctx)
-    _pool_workers = w
-    return _pool
+    if _proc_pool is not None and _proc_pool_workers == w:
+        return _proc_pool
+    if _proc_pool is not None:
+        _proc_pool.shutdown(wait=True, cancel_futures=False)
+        _proc_pool = None
+    _proc_pool = ProcessPoolExecutor(max_workers=w, mp_context=_mp_ctx)
+    _proc_pool_workers = w
+    return _proc_pool
 
 
-def encode_states_parallel(states: list[Any], workers: int) -> np.ndarray:
-    """返回 ``(B, C, H, W)`` float32 numpy，调用方再 ``torch.from_numpy(...).to(device)``。"""
+def _ensure_thread_pool(workers: int) -> ThreadPoolExecutor:
+    global _thread_pool, _thread_pool_workers
+    w = max(1, int(workers))
+    if _thread_pool is not None and _thread_pool_workers == w:
+        return _thread_pool
+    if _thread_pool is not None:
+        _thread_pool.shutdown(wait=False, cancel_futures=False)
+        _thread_pool = None
+    _thread_pool = ThreadPoolExecutor(max_workers=w, thread_name_prefix="xqp_enc")
+    _thread_pool_workers = w
+    return _thread_pool
+
+
+def encode_states_process_pool(states: list[Any], workers: int) -> np.ndarray:
+    """多进程编码（高 IPC 成本；仅在大批量、编码明显变重时考虑）。"""
     if not states:
         return np.zeros((0, 0, 0, 0), dtype=np.float32)
     packed = [pack_planes_state(g) for g in states]
     w_pool = max(1, min(int(workers), len(packed)))
-    pool = _ensure_pool(w_pool)
+    pool = _ensure_proc_pool(w_pool)
     cs = _map_chunksize(len(packed), w_pool)
     planes = list(pool.map(encode_packed_planes, packed, chunksize=cs))
     return np.stack(planes, axis=0)
 
 
+def encode_states_thread_pool(states: list[Any], workers: int) -> np.ndarray:
+    """多线程编码（适合 NumPy 在 C 层释放 GIL 的片段；IPC 低于进程池）。"""
+    if not states:
+        return np.zeros((0, 0, 0, 0), dtype=np.float32)
+    packed = [pack_planes_state(g) for g in states]
+    w_pool = max(1, min(int(workers), len(packed)))
+    pool = _ensure_thread_pool(w_pool)
+    planes = list(pool.map(encode_packed_planes, packed))
+    return np.stack(planes, axis=0)
+
+
+def encode_states_parallel(states: list[Any], workers: int) -> np.ndarray:
+    """兼容旧名：等同 ``encode_states_process_pool``。"""
+    return encode_states_process_pool(states, workers)
+
+
 def encode_states_threaded(states: list[Any], workers: int) -> np.ndarray:
-    """兼容旧名：已改为进程池实现，请优先使用 ``encode_states_parallel``。"""
-    return encode_states_parallel(states, workers)
+    """兼容旧名：等同 ``encode_states_thread_pool``。"""
+    return encode_states_thread_pool(states, workers)
 
 
 def shutdown_encode_pool() -> None:
-    global _pool, _pool_workers
-    if _pool is not None:
-        _pool.shutdown(wait=True, cancel_futures=False)
-        _pool = None
-        _pool_workers = 0
+    global _proc_pool, _proc_pool_workers, _thread_pool, _thread_pool_workers
+    if _proc_pool is not None:
+        _proc_pool.shutdown(wait=True, cancel_futures=False)
+        _proc_pool = None
+        _proc_pool_workers = 0
+    if _thread_pool is not None:
+        _thread_pool.shutdown(wait=True, cancel_futures=False)
+        _thread_pool = None
+        _thread_pool_workers = 0
 
 
 atexit.register(shutdown_encode_pool)
