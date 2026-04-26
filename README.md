@@ -55,6 +55,8 @@ mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 
 **中途存盘**：默认 **`--save-dir runs`**，每 **`--save-every`** 轮（默认 **50**）写入 `runs/ppo_upd_000049.pt` 等（完成第 `upd` 轮后，当 `(upd+1)` 整除 `save_every` 时保存）；训练结束再写 **`runs/mycchess_ppo_last.pt`**。`--save-every 0` 则仅写 `last`。checkpoint 内含 `model`、`in_channels`、可选 `update`，与 `--checkpoint` 微调加载格式一致。
 
+**奖励塑形（初期易瞎逛时）**：`--reward-shaping-step`（默认小负数）在非终局每步施加轻微时间压力；`--reward-shaping-check`（默认小正数）在对手被将军时给额外奖；`--reward-shaping-capture`（默认小正数）在**吃子**时给额外奖（走子前终点格有对方子）。将死仍 **+1**、和棋/规则终局仍 **0**，塑形只加在「未将死」的步上。若要与纯终局一致，将 **check / capture / step** 三者均设为 **0**。
+
 **数据准备 / GPU 占用**：14 路根平面编码计算量很小，**默认 `--encode-backend inline`**（主进程批量 numpy + **一次** H2D），避免 rollout 每步两次大批编码时 **进程池 pickle/IPC** 反压 GPU（表现为 `nvidia-smi` 利用率低、编码 worker 进程 CPU 也低）。可选 `--encode-backend thread` 或 `process`，并配合 `--encode-workers`。**`--rollout-pipeline-groups`**（默认 2）：采样与价值前向在编码阶段把局面拆成两半，主线程与守护线程各编一半再拼批、一次 `trunk`（`eval()` 下与整批一致），叠合 CPU 准备空档；设为 **1** 关闭。rollout 每步仍有 **策略 + 价值** 两次 trunk（状态不同）。若 GPU 仍低，可增大 `--n-env` 或尝试 `torch.compile` 等。
 
 默认训练超参面向 **约 24 核 CPU、64GB 内存、单卡 A100 40GB**（例如 `--n-env 384 --steps 192 --updates 800`）；价值估计与 rollout 旧对数概率均尽量 **批前向** 以提高 GPU 利用率。优化阶段若整批前向（样本数 ≈ `n_env × steps`）会占满激活显存，可用 **`--ppo-mini-batch`**（默认 4096）按小批 **梯度累积** 做 PPO 反向，峰值显存随该值近似线性变化；仍 OOM 时再调小 `--ppo-mini-batch`、`--n-env` 或 `--steps`。

@@ -138,6 +138,24 @@ def main() -> None:
         default=50,
         help="每隔多少轮 update 保存一次 ``ppo_upd_*.pt``（0=仅训练结束时写 last）",
     )
+    p.add_argument(
+        "--reward-shaping-check",
+        type=float,
+        default=0.02,
+        help="非将死终局时，若走子后对手处于应将，每步额外奖励（稀疏棋局下的塑形）；0=关闭",
+    )
+    p.add_argument(
+        "--reward-shaping-step",
+        type=float,
+        default=-0.0005,
+        help="非终局每步加常数（常用小负数以抑制瞎逛）；0=关闭",
+    )
+    p.add_argument(
+        "--reward-shaping-capture",
+        type=float,
+        default=0.025,
+        help="非将死终局时，若本步为吃子，额外奖励；0=关闭",
+    )
     args = p.parse_args()
 
     _setup_logging(args.log_file)
@@ -194,6 +212,15 @@ def main() -> None:
         "checkpoint 目录=%s | save_every=%d（0=仅结束时保存 last）",
         save_dir.resolve(),
         save_every,
+    )
+    rs_chk = float(args.reward_shaping_check)
+    rs_cap = float(args.reward_shaping_capture)
+    rs_stp = float(args.reward_shaping_step)
+    _LOG.info(
+        "奖励塑形 shaping_check=%g shaping_capture=%g shaping_step=%g（全 0=纯终局）",
+        rs_chk,
+        rs_cap,
+        rs_stp,
     )
 
     cfg = PPOConfig(lr=args.lr)
@@ -254,6 +281,9 @@ def main() -> None:
                 encode_workers=enc_w,
                 encode_backend=enc_be,
                 rollout_pipeline_groups=rp_groups,
+                reward_shaping_check=rs_chk,
+                reward_shaping_capture=rs_cap,
+                reward_shaping_step=rs_stp,
             )
             act_buf[t, :] = moves
             rew_buf[t] = rew

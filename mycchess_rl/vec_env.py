@@ -10,6 +10,20 @@ from mycchess_rl.policy_inference import batched_sample_moves_masked, eval_value
 from mycchess_rl.xqwl_state import XqwlGameState
 
 
+def _is_capture_before_move(g: XqwlGameState, mv: str) -> bool:
+    """走子前终点格是否有对方棋子（合法着法下即吃子）。"""
+    if len(mv) < 5 or mv[2] != "-":
+        return False
+    x2, y2 = int(mv[3]), int(mv[4])
+    b = g.board_view()
+    ch = str(b[y2, x2]).strip()
+    if not ch:
+        return False
+    if g.red_to_move:
+        return ch.islower()
+    return ch.isupper()
+
+
 @dataclass
 class SlotState:
     game: XqwlGameState = field(default_factory=XqwlGameState)
@@ -36,7 +50,16 @@ def collect_rollout_step(
     encode_workers: int | None = None,
     encode_backend: str = "inline",
     rollout_pipeline_groups: int = 1,
+    reward_shaping_check: float = 0.0,
+    reward_shaping_capture: float = 0.0,
+    reward_shaping_step: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, list[XqwlGameState], list[str]]:
+    """``reward_shaping_*``：稀疏终局奖励下的轻量塑形（**0 关闭**）。
+
+    - ``reward_shaping_step``：非终局且本步未将死时，每步加常数（常用小负数，抑制无目的长走）。
+    - ``reward_shaping_check``：走子后若**行棋方**（即对手）处于应将，加小正奖（鼓励进攻性将杀压力）。
+    - ``reward_shaping_capture``：走子前终点格有对方子时加小正奖（吃子塑形）。
+    """
     n = vec.n_env
     rewards = np.zeros(n, dtype=np.float32)
     dones = np.zeros(n, dtype=np.bool_)
@@ -69,6 +92,7 @@ def collect_rollout_step(
             continue
         if mv not in leg:
             mv = leg[0]
+        capture = _is_capture_before_move(g, mv) if reward_shaping_capture != 0.0 else False
         g.make_move_iccs(mv)
 
         term, reason = g.terminal()
@@ -80,6 +104,12 @@ def collect_rollout_step(
                 rewards[i] = 0.0
         else:
             dones[i] = False
+            r_shape = float(reward_shaping_step)
+            if reward_shaping_check != 0.0 and g.in_check():
+                r_shape += float(reward_shaping_check)
+            if reward_shaping_capture != 0.0 and capture:
+                r_shape += float(reward_shaping_capture)
+            rewards[i] = r_shape
 
     return rewards, dones, [s.game for s in vec.slots], moves_out
 
