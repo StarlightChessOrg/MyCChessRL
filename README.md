@@ -16,11 +16,11 @@ pip install -e .
 
 ## 编译 `xqwl_core`
 
-源码抽离自 `象棋小巫师/XQWL06.CPP`（`cpp/xqwl_extract.inc`），CMake 默认使用工作区内的 `pybind11-master`。
+源码抽离自 `象棋小巫师/XQWL06.CPP`（`cpp/xqwl_extract.inc`）。**pybind11** 来源按顺序尝试：① `cpp/pybind11`、`../pybind11`、`../../pybind11-master` 等本地目录；② 当前解释器已 `pip install pybind11` 时的 CMake 包路径；③ 若前两者皆无，CMake 会通过 **FetchContent** 从 GitHub 拉取 `v2.13.6`（需网络与 `git`）。也可在配置前执行：`pip install pybind11`。
 
 ```text
 cd MyCChessRL/cpp/build
-cmake .. -DPython_EXECUTABLE=python
+cmake .. -DPython_EXECUTABLE="$(which python)"
 cmake --build . --config Release
 ```
 
