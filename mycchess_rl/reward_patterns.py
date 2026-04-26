@@ -1,9 +1,18 @@
-"""非终局战术类奖励塑形：士象、担子炮、双车、过河卒、马、三子归边、中炮、空头炮、车牵炮、将门等（微弱标量）。"""
+"""非终局战术类奖励塑形：士象、担子炮、双车、过河卒、马、三子归边、中炮、空头炮、车牵炮、将门等（微弱标量）。
+
+性能：棋盘仅 10×9，相对策略/价值网络前向可忽略；本模块用固定坐标网格缓存与 ``numpy`` 切片计数，
+避免每步 ``np.indices`` 分配与部分 Python 环。未使用 Numba：Unicode 棋盘需额外编码才有 nopython 收益，
+默认不增加依赖。
+"""
 from __future__ import annotations
 
 import numpy as np
 
 from mycchess_rl.fen_parse import FULL_INIT_FEN, parse_fen_board
+
+# 固定 10×9：缓存坐标网格，避免每步 ``np.indices`` 分配（rollout 热路径）
+_GRID_Y = np.arange(10, dtype=np.int16)[:, np.newaxis]
+_GRID_X = np.arange(9, dtype=np.int16)[np.newaxis, :]
 
 # ``board_view`` 与 ``np.flip(parse_fen_board(FEN)[0], 0)`` 一致：红在较小 y、黑在较大 y（见 FULL_INIT_FEN）
 _KING_START_XY: tuple[tuple[int, int], tuple[int, int]] | None = None
@@ -64,6 +73,13 @@ _KNIGHT_STEPS: tuple[tuple[int, int, int, int], ...] = (
 )
 
 
+def _cell_nonempty(board: np.ndarray, y: int, x: int) -> bool:
+    t = board[y, x]
+    if t == "" or t == " ":
+        return False
+    return True
+
+
 def _knight_pseudo_reachable(board: np.ndarray, sx: int, sy: int, mover_red: bool) -> list[tuple[int, int]]:
     """从 ``(sx,sy)`` 的马（不计将军）可达落点；蹩马、吃己子排除。"""
     out: list[tuple[int, int]] = []
@@ -71,15 +87,15 @@ def _knight_pseudo_reachable(board: np.ndarray, sx: int, sy: int, mover_red: boo
         fx, fy = sx + lx, sy + ly
         if not (0 <= fx < 9 and 0 <= fy < 10):
             continue
-        if str(board[fy, fx]).strip():
+        if _cell_nonempty(board, fy, fx):
             continue
         dx, dy = sx + ddx, sy + ddy
         if not (0 <= dx < 9 and 0 <= dy < 10):
             continue
-        ch = str(board[dy, dx]).strip()
-        if not ch:
+        if not _cell_nonempty(board, dy, dx):
             out.append((dx, dy))
             continue
+        ch = str(board[dy, dx])
         is_own = ch.isupper() if mover_red else ch.islower()
         if not is_own:
             out.append((dx, dy))
@@ -124,7 +140,7 @@ def advisor_elephant_shape_bonus(board: np.ndarray, mover_red: bool, *, coeff: f
     """士在九宫、象在己方半场的近似阵型奖励。"""
     if coeff == 0.0:
         return 0.0
-    yy, xx = np.indices(board.shape)
+    yy, xx = _GRID_Y, _GRID_X
     if mover_red:
         a_zone = (board == "A") & (yy >= 7) & (xx >= 3) & (xx <= 5)
         b_zone = (board == "B") & (yy >= 5)
@@ -139,18 +155,19 @@ def advisor_elephant_shape_bonus(board: np.ndarray, mover_red: bool, *, coeff: f
 
 
 def _line_between_occupied(board: np.ndarray, y1: int, x1: int, y2: int, x2: int) -> int:
-    pieces = 0
     if x1 == x2:
         lo, hi = sorted((y1, y2))
-        for y in range(lo + 1, hi):
-            if str(board[y, x1]).strip():
-                pieces += 1
-    elif y1 == y2:
+        if hi - lo <= 1:
+            return 0
+        seg = board[lo + 1 : hi, x1]
+        return int(np.count_nonzero(seg != ""))
+    if y1 == y2:
         lo, hi = sorted((x1, x2))
-        for x in range(lo + 1, hi):
-            if str(board[y1, x]).strip():
-                pieces += 1
-    return pieces
+        if hi - lo <= 1:
+            return 0
+        seg = board[y1, lo + 1 : hi]
+        return int(np.count_nonzero(seg != ""))
+    return 0
 
 
 def double_cannon_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) -> float:
@@ -208,7 +225,7 @@ def three_to_edge_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) -> 
     if coeff == 0.0:
         return 0.0
     my_r, my_c, _, _, _ = _piece_sets(mover_red)
-    yy, xx = np.indices(board.shape)
+    yy, xx = _GRID_Y, _GRID_X
     if mover_red:
         opp_half = yy <= 4
     else:
@@ -232,7 +249,7 @@ def central_cannon_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) ->
     if coeff == 0.0:
         return 0.0
     _, my_c, _, _, _ = _piece_sets(mover_red)
-    yy, xx = np.indices(board.shape)
+    yy, xx = _GRID_Y, _GRID_X
     on_file = (board == my_c) & (xx == 4)
     if mover_red:
         on_file = on_file & (yy >= 5)
@@ -243,7 +260,7 @@ def central_cannon_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) ->
     mult = 1.0
     px, py = _opponent_palace_center_xqwl(mover_red)
     opp_n = "n" if mover_red else "N"
-    if str(board[py, px]).strip() == opp_n:
+    if board[py, px] == opp_n:
         mult = 2.0
     return float(coeff * mult)
 
@@ -264,15 +281,17 @@ def open_file_cannon_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) 
         if cx != kx:
             continue
         lo, hi = sorted((cy, ky))
-        mids: list[str] = []
-        for y in range(lo + 1, hi):
-            ch = str(board[y, kx]).strip()
-            if ch:
-                mids.append(ch)
-        if len(mids) == 0:
+        if hi - lo <= 1:
+            continue
+        seg = board[lo + 1 : hi, kx]
+        n_mid = int(np.count_nonzero(seg != ""))
+        if n_mid == 0:
             best = max(best, float(coeff * 0.25))
-        elif len(mids) == 1:
-            ch = mids[0]
+        elif n_mid == 1:
+            idx = int(np.flatnonzero(seg != "")[0])
+            ch = str(seg.ravel()[idx])
+            if not ch:
+                continue
             is_opp = ch.islower() if mover_red else ch.isupper()
             if is_opp and ch != opp_k:
                 best = max(best, float(coeff))
@@ -285,18 +304,12 @@ def _occupied_on_line_segment(
     """与三点共线的整条横线或纵线上的占用格数（含端点）。"""
     if y0 == y1 == y2:
         xa, xb = min(x0, x1, x2), max(x0, x1, x2)
-        n = 0
-        for x in range(xa, xb + 1):
-            if str(board[y0, x]).strip():
-                n += 1
-        return n
+        row = board[y0, xa : xb + 1]
+        return int(np.count_nonzero(row != ""))
     if x0 == x1 == x2:
         ya, yb = min(y0, y1, y2), max(y0, y1, y2)
-        n = 0
-        for y in range(ya, yb + 1):
-            if str(board[y, x0]).strip():
-                n += 1
-        return n
+        col = board[ya : yb + 1, x0]
+        return int(np.count_nonzero(col != ""))
     return 999
 
 
@@ -341,7 +354,7 @@ def opponent_king_gate_block_bonus(board: np.ndarray, mover_red: bool, *, coeff:
         ny, nx = ky + dy, kx + dx
         if not in_pal(nx, ny):
             continue
-        if not str(board[ny, nx]).strip():
+        if not _cell_nonempty(board, ny, nx):
             n_empty += 1
     if n_empty > 1:
         return 0.0
