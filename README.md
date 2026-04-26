@@ -16,7 +16,7 @@ pip install -e .
 
 ## 编译 `xqwl_core`
 
-源码抽离自 `象棋小巫师/XQWL06.CPP`（`cpp/xqwl_extract.inc`）。**pybind11** 来源按顺序尝试：① `cpp/pybind11`、`../pybind11`、`../../pybind11-master` 等本地目录；② 当前解释器已 `pip install pybind11` 时的 CMake 包路径；③ 若前两者皆无，CMake 会通过 **FetchContent** 从 GitHub 拉取 `v2.13.6`（需网络与 `git`）。也可在配置前执行：`pip install pybind11`。
+源码抽离自 `象棋小巫师/XQWL06.CPP`（`cpp/xqwl_extract.inc`）。**pybind11** 已随仓库放在 **`cpp/pybind11-master/`**（固定 tag **v2.13.6**），CMake **优先** `add_subdirectory` 使用该目录，**无需 pip、无需访问 GitHub** 即可配置。若你删掉了该目录，可再装 `pip install pybind11`，或加 **`-DMYCCHESSRL_FETCH_PYBIND11=ON`** 尝试在线拉取。
 
 ```text
 cd MyCChessRL/cpp/build
@@ -33,6 +33,7 @@ cmake --build . --config Release
 | 路径 | 说明 |
 |------|------|
 | `cpp/` | `xqwl_core` CMake 与绑定 |
+| `cpp/pybind11-master/` | 随仓库自带的 [pybind11](https://github.com/pybind/pybind11) v2.13.6 源码（BSD 许可证，见该目录 `LICENSE`） |
 | `mycchess_rl/xqwl_state.py` | `XqwlGameState`：唯一规则入口 |
 | `mycchess_rl/chess/` | 平面编码（无 cchess） |
 | `mycchess_rl/model.py` | `SuccessorPolicy` 与 checkpoint 加载 |
@@ -58,4 +59,4 @@ ResNet 茎输入为 **14×10×9**（与 icyElephant 数据管线一致）。icy 
 
 ## 许可证
 
-原 XQWL、MyElephant 等各自版权与许可证以原项目为准；本仓库见 `LICENSE`。
+原 XQWL、MyElephant 等各自版权与许可证以原项目为准；本仓库见 `LICENSE`。`cpp/pybind11-master/` 为 pybind11 项目源码，以该目录内 `LICENSE` 为准。
