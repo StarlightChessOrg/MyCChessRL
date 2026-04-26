@@ -126,9 +126,25 @@ def main() -> None:
         help="每轮 PPO 优化结束后释放本轮 GPU 大张量并 torch.cuda.empty_cache()；"
         "nvidia-smi 里「常驻」多为 reserved 缓存，非泄漏。用 --no-cuda-empty-cache-each-update 可关闭（略省开销）",
     )
+    p.add_argument(
+        "--save-dir",
+        type=Path,
+        default=Path("runs"),
+        help="checkpoint 与最终权重保存目录（会创建）",
+    )
+    p.add_argument(
+        "--save-every",
+        type=int,
+        default=50,
+        help="每隔多少轮 update 保存一次 ``ppo_upd_*.pt``（0=仅训练结束时写 last）",
+    )
     args = p.parse_args()
 
     _setup_logging(args.log_file)
+    save_dir: Path = args.save_dir
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_every = max(0, int(args.save_every))
+
     enc_w = default_encode_workers() if args.encode_workers is None else int(args.encode_workers)
     enc_be = str(args.encode_backend).strip().lower()
     rp_groups = max(1, int(args.rollout_pipeline_groups))
@@ -173,6 +189,11 @@ def main() -> None:
         enc_w,
         rp_groups,
         int(args.ppo_mini_batch),
+    )
+    _LOG.info(
+        "checkpoint 目录=%s | save_every=%d（0=仅结束时保存 last）",
+        save_dir.resolve(),
+        save_every,
     )
 
     cfg = PPOConfig(lr=args.lr)
@@ -443,8 +464,27 @@ def main() -> None:
                 mem,
             )
 
-    out = Path("mycchess_ppo_last.pt")
-    torch.save({"model": model.state_dict(), "in_channels": model.in_channels}, out)
+        if save_every > 0 and (upd + 1) % save_every == 0:
+            ckpt = save_dir / f"ppo_upd_{upd:06d}.pt"
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "in_channels": model.in_channels,
+                    "update": int(upd),
+                },
+                ckpt,
+            )
+            _LOG.info("已保存中途 checkpoint update=%d -> %s", upd, ckpt)
+
+    out = save_dir / "mycchess_ppo_last.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "in_channels": model.in_channels,
+            "update": int(args.updates) - 1,
+        },
+        out,
+    )
     total_s = time.perf_counter() - t_train0
     _LOG.info("训练结束 wall_total=%.1fs | 已保存 %s", total_s, out)
 

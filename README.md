@@ -47,10 +47,13 @@ cmake --build . --config Release
 ```bash
 python -m mycchess_rl.train_ppo
 python -m mycchess_rl.train_ppo --log-file runs/ppo.log --log-every 5
+python -m mycchess_rl.train_ppo --save-dir runs --save-every 100
 mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 ```
 
 训练脚本会按轮打印 **rollout / 优化耗时、样本数、GAE 统计、分项损失、熵、importance ratio、clip 比例、近似 KL、梯度范数、CUDA 显存** 等；`--log-every N` 为每 N 轮打一次，`--log-file` 同步写入文件。`--rollout-log-every`（默认 32）在单轮 rollout 内输出进度，避免首轮长时间无输出。
+
+**中途存盘**：默认 **`--save-dir runs`**，每 **`--save-every`** 轮（默认 **50**）写入 `runs/ppo_upd_000049.pt` 等（完成第 `upd` 轮后，当 `(upd+1)` 整除 `save_every` 时保存）；训练结束再写 **`runs/mycchess_ppo_last.pt`**。`--save-every 0` 则仅写 `last`。checkpoint 内含 `model`、`in_channels`、可选 `update`，与 `--checkpoint` 微调加载格式一致。
 
 **数据准备 / GPU 占用**：14 路根平面编码计算量很小，**默认 `--encode-backend inline`**（主进程批量 numpy + **一次** H2D），避免 rollout 每步两次大批编码时 **进程池 pickle/IPC** 反压 GPU（表现为 `nvidia-smi` 利用率低、编码 worker 进程 CPU 也低）。可选 `--encode-backend thread` 或 `process`，并配合 `--encode-workers`。**`--rollout-pipeline-groups`**（默认 2）：采样与价值前向在编码阶段把局面拆成两半，主线程与守护线程各编一半再拼批、一次 `trunk`（`eval()` 下与整批一致），叠合 CPU 准备空档；设为 **1** 关闭。rollout 每步仍有 **策略 + 价值** 两次 trunk（状态不同）。若 GPU 仍低，可增大 `--n-env` 或尝试 `torch.compile` 等。
 
