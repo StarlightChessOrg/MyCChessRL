@@ -198,6 +198,11 @@ def _piece_sets(mover_red: bool) -> tuple[str, str, str, str, str]:
     return "r", "c", "R", "C", "K"
 
 
+def _opponent_palace_center_xqwl(mover_red: bool) -> tuple[int, int]:
+    """与对方半场划分一致（同 ``central_cannon``）：黑九宫心 ``(4,1)``，红九宫心 ``(4,8)``。"""
+    return (4, 1) if mover_red else (4, 8)
+
+
 def three_to_edge_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) -> float:
     """三子归边近似：车/马/炮在对方半场一侧翼（x≤2 或 x≥6）上至少 3 枚。"""
     if coeff == 0.0:
@@ -221,7 +226,9 @@ def three_to_edge_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) -> 
 
 
 def central_cannon_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) -> float:
-    """中炮近似：己方炮在纵线 x=4 且仍在己方河界一侧。"""
+    """中炮近似：己方炮在纵线 x=4 且仍在己方河界一侧。
+    若对方马恰在对方九宫心且与中炮同列（x=4），视为中炮镇马，**奖励加倍**。
+    """
     if coeff == 0.0:
         return 0.0
     _, my_c, _, _, _ = _piece_sets(mover_red)
@@ -233,7 +240,12 @@ def central_cannon_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) ->
         on_file = on_file & (yy <= 4)
     if not bool(on_file.any()):
         return 0.0
-    return float(coeff)
+    mult = 1.0
+    px, py = _opponent_palace_center_xqwl(mover_red)
+    opp_n = "n" if mover_red else "N"
+    if str(board[py, px]).strip() == opp_n:
+        mult = 2.0
+    return float(coeff * mult)
 
 
 def open_file_cannon_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) -> float:
