@@ -1,7 +1,40 @@
-"""非终局战术类奖励塑形：士象、担子炮、双车、过河卒、马、三子归边、中炮、空头炮、车牵炮等（微弱标量）。"""
+"""非终局战术类奖励塑形：士象、担子炮、双车、过河卒、马、三子归边、中炮、空头炮、车牵炮、将门等（微弱标量）。"""
 from __future__ import annotations
 
 import numpy as np
+
+from mycchess_rl.fen_parse import FULL_INIT_FEN, parse_fen_board
+
+# ``board_view`` 与 ``np.flip(parse_fen_board(FEN)[0], 0)`` 一致：红在较小 y、黑在较大 y（见 FULL_INIT_FEN）
+_KING_START_XY: tuple[tuple[int, int], tuple[int, int]] | None = None
+
+
+def _king_start_xy_cached() -> tuple[tuple[int, int], tuple[int, int]]:
+    """``(x,y)`` 红帅、黑将的初始格（与当前仓库 ``board_view`` 约定一致）。"""
+    global _KING_START_XY
+    if _KING_START_XY is None:
+        arr, _ = parse_fen_board(FULL_INIT_FEN)
+        v = np.flip(np.asarray(arr), axis=0)
+        rk = np.argwhere(v == "K")
+        bk = np.argwhere(v == "k")
+        _KING_START_XY = (
+            (int(rk[0][1]), int(rk[0][0])),
+            (int(bk[0][1]), int(bk[0][0])),
+        )
+    return _KING_START_XY
+
+
+def _in_red_palace(x: int, y: int) -> bool:
+    return 3 <= x <= 5 and 0 <= y <= 2
+
+
+def _in_black_palace(x: int, y: int) -> bool:
+    return 3 <= x <= 5 and 7 <= y <= 9
+
+
+def _palace_geom_center(*, red_king: bool) -> tuple[int, int]:
+    """九宫几何中心（非 ``_own_palace_center`` 马用坐标）。"""
+    return (4, 1) if red_king else (4, 8)
 
 
 def _own_palace_center(red: bool) -> tuple[int, int]:
@@ -279,6 +312,79 @@ def rook_pin_opposite_cannon_bonus(board: np.ndarray, mover_red: bool, *, coeff:
     return 0.0
 
 
+def opponent_king_gate_block_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) -> float:
+    """对方将在九宫内「门」被堵：宫内正交空格步很少时给走子方微弱奖。"""
+    if coeff == 0.0:
+        return 0.0
+    opp_k = "k" if mover_red else "K"
+    pos = np.argwhere(board == opp_k)
+    if pos.size == 0:
+        return 0.0
+    ky, kx = int(pos[0][0]), int(pos[0][1])
+    in_pal = _in_black_palace if mover_red else _in_red_palace
+    if not in_pal(kx, ky):
+        return 0.0
+    n_empty = 0
+    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        ny, nx = ky + dy, kx + dx
+        if not in_pal(nx, ny):
+            continue
+        if not str(board[ny, nx]).strip():
+            n_empty += 1
+    if n_empty > 1:
+        return 0.0
+    return float(coeff * (0.55 + 0.45 * (1 - n_empty)))
+
+
+def missing_advisor_vs_double_rook_penalty(board: np.ndarray, mover_red: bool, *, coeff: float) -> float:
+    """己方缺士（士少于 2）且对方有两车：惩罚走子方（系数为正则奖励减去该值）。"""
+    if coeff == 0.0:
+        return 0.0
+    if mover_red:
+        n_a = int(np.sum(board == "A"))
+        n_opp_r = int(np.sum(board == "r"))
+    else:
+        n_a = int(np.sum(board == "a"))
+        n_opp_r = int(np.sum(board == "R"))
+    if n_a >= 2 or n_opp_r < 2:
+        return 0.0
+    return float(-coeff)
+
+
+def double_advisor_king_center_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) -> float:
+    """己方恰双士且将/帅在九宫几何中心。"""
+    if coeff == 0.0:
+        return 0.0
+    my_k = "K" if mover_red else "k"
+    my_a = "A" if mover_red else "a"
+    if int(np.sum(board == my_a)) != 2:
+        return 0.0
+    pos = np.argwhere(board == my_k)
+    if pos.size == 0:
+        return 0.0
+    ky, kx = int(pos[0][0]), int(pos[0][1])
+    cx, cy = _palace_geom_center(red_king=mover_red)
+    if kx == cx and ky == cy:
+        return float(coeff)
+    return 0.0
+
+
+def king_near_start_bonus(board: np.ndarray, mover_red: bool, *, coeff: float) -> float:
+    """己将/帅距初始位曼哈顿越近奖越大：``coeff * max(0, 1 - dist/dmax)``。"""
+    if coeff == 0.0:
+        return 0.0
+    my_k = "K" if mover_red else "k"
+    pos = np.argwhere(board == my_k)
+    if pos.size == 0:
+        return 0.0
+    ky, kx = int(pos[0][0]), int(pos[0][1])
+    (sx_r, sy_r), (sx_b, sy_b) = _king_start_xy_cached()
+    sx, sy = (sx_r, sy_r) if mover_red else (sx_b, sy_b)
+    dist = abs(kx - sx) + abs(ky - sy)
+    dmax = 10.0
+    return float(coeff * max(0.0, 1.0 - float(dist) / dmax))
+
+
 def tactics_shaping_total(
     board: np.ndarray,
     piece_at_dst: str,
@@ -295,6 +401,10 @@ def tactics_shaping_total(
     coeff_central_cannon: float,
     coeff_open_cannon: float,
     coeff_rook_pin_cannon: float,
+    coeff_opp_king_gate: float,
+    coeff_miss_adv_double_rook: float,
+    coeff_double_adv_king_center: float,
+    coeff_king_near_start: float,
 ) -> float:
     """走子后局面上的战术塑形总和（仅当对应 coeff 非 0 时计算）。"""
     if all(
@@ -309,6 +419,10 @@ def tactics_shaping_total(
             coeff_central_cannon,
             coeff_open_cannon,
             coeff_rook_pin_cannon,
+            coeff_opp_king_gate,
+            coeff_miss_adv_double_rook,
+            coeff_double_adv_king_center,
+            coeff_king_near_start,
         )
     ):
         return 0.0
@@ -331,4 +445,16 @@ def tactics_shaping_total(
         total += open_file_cannon_bonus(board, last_mover_red, coeff=coeff_open_cannon)
     if coeff_rook_pin_cannon != 0.0:
         total += rook_pin_opposite_cannon_bonus(board, last_mover_red, coeff=coeff_rook_pin_cannon)
+    if coeff_opp_king_gate != 0.0:
+        total += opponent_king_gate_block_bonus(board, last_mover_red, coeff=coeff_opp_king_gate)
+    if coeff_miss_adv_double_rook != 0.0:
+        total += missing_advisor_vs_double_rook_penalty(
+            board, last_mover_red, coeff=coeff_miss_adv_double_rook
+        )
+    if coeff_double_adv_king_center != 0.0:
+        total += double_advisor_king_center_bonus(
+            board, last_mover_red, coeff=coeff_double_adv_king_center
+        )
+    if coeff_king_near_start != 0.0:
+        total += king_near_start_bonus(board, last_mover_red, coeff=coeff_king_near_start)
     return float(total)

@@ -216,6 +216,30 @@ def main() -> None:
         default=0.0,
         help="车牵炮近似（己车与对方车炮共线且该线仅这三子）；0=关闭",
     )
+    p.add_argument(
+        "--reward-shaping-opp-king-gate",
+        type=float,
+        default=0.0,
+        help="对方将在九宫内可进空格≤1（将门被堵）时奖走子方；0=关闭",
+    )
+    p.add_argument(
+        "--reward-shaping-miss-adv-double-rook",
+        type=float,
+        default=0.0,
+        help="己方士<2且对方两车：每步减去该系数（惩罚）；0=关闭",
+    )
+    p.add_argument(
+        "--reward-shaping-double-adv-king-center",
+        type=float,
+        default=0.0,
+        help="己方恰双士且将在九宫几何中心；0=关闭",
+    )
+    p.add_argument(
+        "--reward-shaping-king-near-start",
+        type=float,
+        default=0.0,
+        help="己将/帅距开局位置越近奖越大（曼哈顿/10）；0=关闭",
+    )
     args = p.parse_args()
 
     _setup_logging(args.log_file)
@@ -286,9 +310,13 @@ def main() -> None:
     rs_ccan = float(args.reward_shaping_central_cannon)
     rs_ocan = float(args.reward_shaping_open_cannon)
     rs_rpc = float(args.reward_shaping_rook_pin_cannon)
+    rs_okg = float(args.reward_shaping_opp_king_gate)
+    rs_madr = float(args.reward_shaping_miss_adv_double_rook)
+    rs_dakc = float(args.reward_shaping_double_adv_king_center)
+    rs_kns = float(args.reward_shaping_king_near_start)
     _LOG.info(
         "奖励塑形 step=%g check=%g king_prox=%g capture=%g | 战术 ae=%g dcan=%g rpair=%g xpawn=%g kflex=%g "
-        "3edge=%g ccan=%g ocan=%g rpc=%g（全 0=纯终局）",
+        "3edge=%g ccan=%g ocan=%g rpc=%g okg=%g madr=%g dakc=%g kns=%g（全 0=纯终局）",
         rs_stp,
         rs_chk,
         rs_kpx,
@@ -302,6 +330,10 @@ def main() -> None:
         rs_ccan,
         rs_ocan,
         rs_rpc,
+        rs_okg,
+        rs_madr,
+        rs_dakc,
+        rs_kns,
     )
 
     cfg = PPOConfig(lr=args.lr)
@@ -375,6 +407,10 @@ def main() -> None:
                 reward_shaping_central_cannon=rs_ccan,
                 reward_shaping_open_cannon=rs_ocan,
                 reward_shaping_rook_pin_cannon=rs_rpc,
+                reward_shaping_opp_king_gate=rs_okg,
+                reward_shaping_miss_adv_double_rook=rs_madr,
+                reward_shaping_double_adv_king_center=rs_dakc,
+                reward_shaping_king_near_start=rs_kns,
             )
             act_buf[t, :] = moves
             rew_buf[t] = rew

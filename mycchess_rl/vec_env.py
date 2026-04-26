@@ -109,6 +109,10 @@ def collect_rollout_step(
     reward_shaping_central_cannon: float = 0.0,
     reward_shaping_open_cannon: float = 0.0,
     reward_shaping_rook_pin_cannon: float = 0.0,
+    reward_shaping_opp_king_gate: float = 0.0,
+    reward_shaping_miss_adv_double_rook: float = 0.0,
+    reward_shaping_double_adv_king_center: float = 0.0,
+    reward_shaping_king_near_start: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, list[XqwlGameState], list[str]]:
     """``reward_shaping_*``：稀疏终局奖励下的轻量塑形（**0 关闭**）。
 
@@ -118,6 +122,7 @@ def collect_rollout_step(
     - ``reward_shaping_king_prox``：每步（非终局）额外 ``×prox``，微弱鼓励压将。
     - ``reward_shaping_ae_shape`` … ``knight_flex``：见 ``reward_patterns.tactics_shaping_total``。
     - ``three_edge`` / ``central_cannon`` / ``open_cannon`` / ``rook_pin_cannon``：三子归边、中炮、空头炮、车牵炮近似。
+    - ``opp_king_gate`` / ``miss_adv_double_rook`` / ``double_adv_king_center`` / ``king_near_start``：将门封锁、缺士对双车、双士宫心、将归位。
     """
     n = vec.n_env
     rewards = np.zeros(n, dtype=np.float32)
@@ -193,6 +198,10 @@ def collect_rollout_step(
                 coeff_central_cannon=float(reward_shaping_central_cannon),
                 coeff_open_cannon=float(reward_shaping_open_cannon),
                 coeff_rook_pin_cannon=float(reward_shaping_rook_pin_cannon),
+                coeff_opp_king_gate=float(reward_shaping_opp_king_gate),
+                coeff_miss_adv_double_rook=float(reward_shaping_miss_adv_double_rook),
+                coeff_double_adv_king_center=float(reward_shaping_double_adv_king_center),
+                coeff_king_near_start=float(reward_shaping_king_near_start),
             )
             rewards[i] = r_shape
 
