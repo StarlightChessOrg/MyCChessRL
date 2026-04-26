@@ -35,6 +35,7 @@ def collect_rollout_step(
     generator: object | None = None,
     encode_workers: int | None = None,
     encode_backend: str = "inline",
+    rollout_pipeline_groups: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, list[XqwlGameState], list[str]]:
     n = vec.n_env
     rewards = np.zeros(n, dtype=np.float32)
@@ -53,6 +54,7 @@ def collect_rollout_step(
         generator=generator,
         encode_workers=ew,
         encode_backend=encode_backend,
+        rollout_pipeline_groups=int(rollout_pipeline_groups),
     )
     for j, i in enumerate(active):
         moves_out[i] = sampled[j]

@@ -1,6 +1,7 @@
 """推理：两阶段合法掩码 + 贪心 / 采样。"""
 from __future__ import annotations
 
+import threading
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -22,6 +23,32 @@ def _legal_moves_sorted_tuples(st: XqwlGameState) -> list[tuple[int, int, int, i
     if not ms:
         return []
     return sorted(parse_move_squares(m) for m in ms)
+
+
+def _xb_from_states_two_group_encode(states: list[XqwlGameState], device: torch.device) -> torch.Tensor:
+    """两组局面并行 CPU 编码（主线程一半 + 守护线程一半），``np.concatenate`` 后一次 H2D。
+
+    ``model.eval()`` 下 trunk 按行独立，与整批一次编码再 trunk 数值一致；用于叠合 CPU 准备空档。
+    """
+    from mycchess_rl.encode_parallel import encode_states_inline
+
+    b = len(states)
+    if b <= 1:
+        chw = encode_states_inline(states)
+        return torch.from_numpy(np.ascontiguousarray(chw)).to(device, non_blocking=True)
+    mid = (b + 1) // 2
+    s0, s1 = states[:mid], states[mid:]
+    chw1_box: list[np.ndarray] = []
+
+    def _enc_second_half() -> None:
+        chw1_box.append(encode_states_inline(s1))
+
+    th = threading.Thread(target=_enc_second_half, daemon=True)
+    th.start()
+    chw0 = encode_states_inline(s0)
+    th.join()
+    chw = np.concatenate([chw0, chw1_box[0]], axis=0)
+    return torch.from_numpy(np.ascontiguousarray(chw)).to(device, non_blocking=True)
 
 
 def _encode_state_current_nchw(state: XqwlGameState, flist: dict[str, list[str]], device: torch.device) -> torch.Tensor:
@@ -152,8 +179,13 @@ def batched_sample_moves_masked(
     generator: torch.Generator | None = None,
     encode_workers: int = 1,
     encode_backend: str = "inline",
+    rollout_pipeline_groups: int = 1,
 ) -> list[str]:
-    """整批 trunk + 批量 ``head_dst``，避免逐环境 B 次小矩阵乘。"""
+    """整批 trunk + 批量 ``head_dst``，避免逐环境 B 次小矩阵乘。
+
+    ``rollout_pipeline_groups>=2`` 时启用两组并行 CPU 编码（与单次 trunk 叠合准备空档）；
+    该路径固定使用主进程 ``encode_states_inline``，忽略 ``encode_backend`` 的 thread/process。
+    """
     T = policy_temperature_scalar(policy_temperature)
     model.eval()
     B = len(states)
@@ -164,13 +196,16 @@ def batched_sample_moves_masked(
     has_legal_list = [bool(lt) for lt in legals_t]
     has_legal = torch.tensor(has_legal_list, dtype=torch.bool, device=device)
 
-    xb = batched_encode_roots(
-        states,
-        flist,
-        device,
-        encode_workers=encode_workers,
-        encode_backend=encode_backend,
-    )
+    if int(rollout_pipeline_groups) >= 2 and B >= 2:
+        xb = _xb_from_states_two_group_encode(states, device)
+    else:
+        xb = batched_encode_roots(
+            states,
+            flist,
+            device,
+            encode_workers=encode_workers,
+            encode_backend=encode_backend,
+        )
     feat_b = model._trunk_flat(xb)
     ls_b = model.head_src(feat_b)
     scaled_s = ls_b / T
@@ -325,8 +360,12 @@ def batched_value_expectation(
     *,
     encode_workers: int = 1,
     encode_backend: str = "inline",
+    rollout_pipeline_groups: int = 1,
 ) -> torch.Tensor:
-    """单次 ``_trunk_flat`` 批前向，避免逐环境调用 ``eval_value_stm`` 导致 GPU 吃不饱。"""
+    """单次 ``_trunk_flat`` 批前向，避免逐环境调用 ``eval_value_stm`` 导致 GPU 吃不饱。
+
+    ``rollout_pipeline_groups>=2`` 且存在需网络估值的活跃局面时，对活跃子批做两组并行编码（同采样路径）。
+    """
     n = len(states)
     if n == 0:
         return torch.zeros(0, device=device, dtype=torch.float32)
@@ -345,13 +384,17 @@ def batched_value_expectation(
             active_states.append(g)
     if active_states:
         model.eval()
-        xb = batched_encode_roots(
-            active_states,
-            flist,
-            device,
-            encode_workers=encode_workers,
-            encode_backend=encode_backend,
-        )
+        na = len(active_states)
+        if int(rollout_pipeline_groups) >= 2 and na >= 2:
+            xb = _xb_from_states_two_group_encode(active_states, device)
+        else:
+            xb = batched_encode_roots(
+                active_states,
+                flist,
+                device,
+                encode_workers=encode_workers,
+                encode_backend=encode_backend,
+            )
         feat = model._trunk_flat(xb)
         logits_v = model.value_head(feat)
         vals = _scalar_value_from_logits_v(logits_v)

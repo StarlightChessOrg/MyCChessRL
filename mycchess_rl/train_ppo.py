@@ -110,11 +110,19 @@ def main() -> None:
         default=4096,
         help="PPO 反向时 GPU mini-batch 大小；整轮样本可达数万，过小则慢、过大易 OOM（A100 40GB 建议 2048~8192）",
     )
+    p.add_argument(
+        "--rollout-pipeline-groups",
+        type=int,
+        default=2,
+        help="rollout 采样/价值前向时 CPU 编码分组数；>=2 时两半局面并行编码（主线程+守护线程）再拼批一次 trunk，"
+        "叠合准备空档；1=关闭（与旧行为一致）",
+    )
     args = p.parse_args()
 
     _setup_logging(args.log_file)
     enc_w = default_encode_workers() if args.encode_workers is None else int(args.encode_workers)
     enc_be = str(args.encode_backend).strip().lower()
+    rp_groups = max(1, int(args.rollout_pipeline_groups))
 
     device = torch.device("cpu")
     if args.gpu >= 0 and torch.cuda.is_available():
@@ -150,9 +158,10 @@ def main() -> None:
         name = torch.cuda.get_device_name(idx)
         _LOG.info("CUDA 设备: [%d] %s", idx, name)
     _LOG.info(
-        "特征编码 backend=%s encode_workers=%d（仅 thread/process）| PPO mini-batch=%d",
+        "特征编码 backend=%s encode_workers=%d（仅 thread/process）| rollout_pipeline_groups=%d | PPO mini-batch=%d",
         enc_be,
         enc_w,
+        rp_groups,
         int(args.ppo_mini_batch),
     )
 
@@ -191,6 +200,7 @@ def main() -> None:
                 flist,
                 encode_workers=enc_w,
                 encode_backend=enc_be,
+                rollout_pipeline_groups=rp_groups,
             )
             v_cur = v_cur.detach().float().cpu().numpy()
 
@@ -212,6 +222,7 @@ def main() -> None:
                 generator=gen,
                 encode_workers=enc_w,
                 encode_backend=enc_be,
+                rollout_pipeline_groups=rp_groups,
             )
             act_buf[t, :] = moves
             rew_buf[t] = rew
@@ -227,6 +238,7 @@ def main() -> None:
                     flist,
                     encode_workers=enc_w,
                     encode_backend=enc_be,
+                    rollout_pipeline_groups=rp_groups,
                 )
                 v_cur = v_cur.detach().float().cpu().numpy()
             reset_finished(vec, done)
@@ -252,6 +264,7 @@ def main() -> None:
                 flist,
                 encode_workers=enc_w,
                 encode_backend=enc_be,
+                rollout_pipeline_groups=rp_groups,
             )
             last_v = last_v.detach().float().cpu().numpy()
         adv, ret = compute_gae(rew_buf, val_buf, done_buf, last_v, gamma=cfg.gamma, lam=cfg.gae_lambda)
