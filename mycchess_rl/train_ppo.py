@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from mycchess_rl.encode_parallel import default_encode_workers
 from mycchess_rl.model import SuccessorPolicy, load_successor_policy_for_play
 from mycchess_rl.policy_inference import (
     batched_encode_roots,
@@ -89,9 +90,16 @@ def main() -> None:
         default=32,
         help="rollout 内每隔多少 timestep 打一条进度（0=关闭）",
     )
+    p.add_argument(
+        "--encode-workers",
+        type=int,
+        default=None,
+        help="CPU 特征编码线程数；省略则 min(8, CPU核数)；1=强制单线程",
+    )
     args = p.parse_args()
 
     _setup_logging(args.log_file)
+    enc_w = default_encode_workers() if args.encode_workers is None else int(args.encode_workers)
 
     device = torch.device("cpu")
     if args.gpu >= 0 and torch.cuda.is_available():
@@ -126,6 +134,7 @@ def main() -> None:
         idx = device.index if device.index is not None else 0
         name = torch.cuda.get_device_name(idx)
         _LOG.info("CUDA 设备: [%d] %s", idx, name)
+    _LOG.info("特征编码 encode_workers=%d（线程池 + 采样整批 head_dst）", enc_w)
 
     cfg = PPOConfig(lr=args.lr)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
@@ -155,7 +164,9 @@ def main() -> None:
 
         t_roll0 = time.perf_counter()
         with torch.no_grad():
-            v_cur = batched_value_expectation([s.game for s in vec.slots], model, device, flist)
+            v_cur = batched_value_expectation(
+                [s.game for s in vec.slots], model, device, flist, encode_workers=enc_w
+            )
             v_cur = v_cur.detach().float().cpu().numpy()
 
         n_done_rollout = 0
@@ -168,7 +179,13 @@ def main() -> None:
             val_buf[t] = v_cur
 
             rew, done, _, moves = collect_rollout_step(
-                vec, model, device, flist, policy_temperature=1.0, generator=gen
+                vec,
+                model,
+                device,
+                flist,
+                policy_temperature=1.0,
+                generator=gen,
+                encode_workers=enc_w,
             )
             act_buf[t, :] = moves
             rew_buf[t] = rew
@@ -177,7 +194,9 @@ def main() -> None:
             mean_abs_rew += float(np.abs(rew).sum())
 
             with torch.no_grad():
-                v_cur = batched_value_expectation([s.game for s in vec.slots], model, device, flist)
+                v_cur = batched_value_expectation(
+                    [s.game for s in vec.slots], model, device, flist, encode_workers=enc_w
+                )
                 v_cur = v_cur.detach().float().cpu().numpy()
             reset_finished(vec, done)
 
@@ -195,7 +214,9 @@ def main() -> None:
         rollout_s = t_roll1 - t_roll0
 
         with torch.no_grad():
-            last_v = batched_value_expectation([s.game for s in vec.slots], model, device, flist)
+            last_v = batched_value_expectation(
+                [s.game for s in vec.slots], model, device, flist, encode_workers=enc_w
+            )
             last_v = last_v.detach().float().cpu().numpy()
         adv, ret = compute_gae(rew_buf, val_buf, done_buf, last_v, gamma=cfg.gamma, lam=cfg.gae_lambda)
         adv_mean_b, adv_std_b = float(adv.mean()), float(adv.std())
@@ -238,7 +259,7 @@ def main() -> None:
             len(obs_list),
             slots_total,
         )
-        xb = batched_encode_roots(obs_list, flist, device)
+        xb = batched_encode_roots(obs_list, flist, device, encode_workers=enc_w)
         with torch.no_grad():
             model.eval()
             feat_roll = model._trunk_flat(xb)

@@ -99,9 +99,19 @@ def batched_encode_roots(
     states: list[XqwlGameState],
     flist: dict[str, list[str]],
     device: torch.device,
+    *,
+    encode_workers: int = 1,
 ) -> torch.Tensor:
-    xs = [_encode_state_current_nchw(g, flist, device) for g in states]
-    return torch.cat(xs, dim=0) if xs else torch.zeros(0, device=device)
+    if not states:
+        return torch.zeros(0, device=device)
+    from mycchess_rl.encode_parallel import encode_states_threaded, resolve_encode_workers
+
+    w = resolve_encode_workers(encode_workers, len(states))
+    if w <= 1:
+        xs = [_encode_state_current_nchw(g, flist, device) for g in states]
+        return torch.cat(xs, dim=0)
+    chw = encode_states_threaded(states, w)
+    return torch.from_numpy(np.ascontiguousarray(chw)).to(device, non_blocking=True)
 
 
 @torch.no_grad()
@@ -113,38 +123,75 @@ def batched_sample_moves_masked(
     *,
     policy_temperature: float = 1.0,
     generator: torch.Generator | None = None,
+    encode_workers: int = 1,
 ) -> list[str]:
+    """整批 trunk + 批量 ``head_dst``，避免逐环境 B 次小矩阵乘。"""
     T = policy_temperature_scalar(policy_temperature)
     model.eval()
-    xb = batched_encode_roots(states, flist, device)
-    if xb.shape[0] == 0:
+    B = len(states)
+    if B == 0:
         return []
+
+    has_legal_list = [bool(st.legal_moves_iccs_str()) for st in states]
+    has_legal = torch.tensor(has_legal_list, dtype=torch.bool, device=device)
+
+    xb = batched_encode_roots(states, flist, device, encode_workers=encode_workers)
     feat_b = model._trunk_flat(xb)
     ls_b = model.head_src(feat_b)
-    out_moves: list[str] = []
+    scaled_s = ls_b / T
+
+    src_ok = torch.zeros(B, POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
     for bi, st in enumerate(states):
-        legals_t = sorted(st.legal_moves_iccs())
-        if not legals_t:
-            out_moves.append("")
+        if not has_legal_list[bi]:
             continue
-        ls = ls_b[bi]
-        src_mask = torch.zeros(POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
-        for x1, y1, _, _ in legals_t:
-            src_mask[y1 * 9 + x1] = True
-        p_src = torch.softmax((ls / T).masked_fill(~src_mask, -1e9), dim=0)
-        src_i = int(torch.multinomial(p_src, 1, generator=generator).item())
-        sx, sy = src_i % 9, src_i // 9
-        oh = torch.zeros(1, POLICY_GRID_NUMEL, device=device, dtype=feat_b.dtype)
-        oh[0, src_i] = 1.0
-        ld = model.head_dst(torch.cat([feat_b[bi : bi + 1], oh], dim=1))[0]
-        dst_mask = torch.zeros(POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
-        for x1, y1, x2, y2 in legals_t:
+        for x1, y1, _, _ in sorted(st.legal_moves_iccs()):
+            src_ok[bi, y1 * 9 + x1] = True
+
+    logits_s = scaled_s.masked_fill(~src_ok, -1e9)
+    safe_s = torch.full_like(logits_s, -1e9)
+    safe_s[:, 0] = 0.0
+    logits_s = torch.where(has_legal.unsqueeze(1), logits_s, safe_s)
+
+    p_src = torch.softmax(logits_s, dim=1)
+    src_idx = torch.multinomial(p_src, 1, generator=generator).squeeze(1)
+
+    oh_s = torch.zeros(B, POLICY_GRID_NUMEL, device=device, dtype=feat_b.dtype)
+    oh_s.scatter_(1, src_idx.unsqueeze(1), 1.0)
+    logits_d = model.head_dst(torch.cat([feat_b, oh_s], dim=1))
+    scaled_d = logits_d / T
+
+    dst_ok = torch.zeros(B, POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
+    sx_all = (src_idx % 9).tolist()
+    sy_all = (src_idx // 9).tolist()
+    for bi, st in enumerate(states):
+        if not has_legal_list[bi]:
+            continue
+        sx, sy = int(sx_all[bi]), int(sy_all[bi])
+        for x1, y1, x2, y2 in sorted(st.legal_moves_iccs()):
             if (x1, y1) == (sx, sy):
-                dst_mask[y2 * 9 + x2] = True
-        p_dst = torch.softmax((ld / T).masked_fill(~dst_mask, -1e9), dim=0)
-        dst_i = int(torch.multinomial(p_dst, 1, generator=generator).item())
-        dx, dy = dst_i % 9, dst_i // 9
-        out_moves.append(f"{sx}{sy}-{dx}{dy}")
+                dst_ok[bi, y2 * 9 + x2] = True
+
+    logits_d_m = scaled_d.masked_fill(~dst_ok, -1e9)
+    safe_d = torch.full_like(logits_d_m, -1e9)
+    safe_d[:, 0] = 0.0
+    logits_d_m = torch.where(has_legal.unsqueeze(1), logits_d_m, safe_d)
+
+    p_dst = torch.softmax(logits_d_m, dim=1)
+    dst_idx = torch.multinomial(p_dst, 1, generator=generator).squeeze(1)
+
+    sx_np = (src_idx % 9).detach().cpu().numpy()
+    sy_np = (src_idx // 9).detach().cpu().numpy()
+    dx_np = (dst_idx % 9).detach().cpu().numpy()
+    dy_np = (dst_idx // 9).detach().cpu().numpy()
+
+    out_moves: list[str] = []
+    for bi in range(B):
+        if not has_legal_list[bi]:
+            out_moves.append("")
+        else:
+            out_moves.append(
+                f"{int(sx_np[bi])}{int(sy_np[bi])}-{int(dx_np[bi])}{int(dy_np[bi])}"
+            )
     return out_moves
 
 
@@ -240,6 +287,8 @@ def batched_value_expectation(
     model: SuccessorPolicy,
     device: torch.device,
     flist: dict[str, list[str]],
+    *,
+    encode_workers: int = 1,
 ) -> torch.Tensor:
     """单次 ``_trunk_flat`` 批前向，避免逐环境调用 ``eval_value_stm`` 导致 GPU 吃不饱。"""
     n = len(states)
@@ -260,7 +309,7 @@ def batched_value_expectation(
             active_states.append(g)
     if active_states:
         model.eval()
-        xb = batched_encode_roots(active_states, flist, device)
+        xb = batched_encode_roots(active_states, flist, device, encode_workers=encode_workers)
         feat = model._trunk_flat(xb)
         logits_v = model.value_head(feat)
         vals = _scalar_value_from_logits_v(logits_v)

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from mycchess_rl.encode_parallel import default_encode_workers
 from mycchess_rl.policy_inference import batched_sample_moves_masked, eval_value_stm
 from mycchess_rl.xqwl_state import XqwlGameState
 
@@ -32,6 +33,7 @@ def collect_rollout_step(
     *,
     policy_temperature: float = 1.0,
     generator: object | None = None,
+    encode_workers: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[XqwlGameState], list[str]]:
     n = vec.n_env
     rewards = np.zeros(n, dtype=np.float32)
@@ -40,8 +42,15 @@ def collect_rollout_step(
 
     active = list(range(n))
     gps = [vec.slots[i].game for i in active]
+    ew = default_encode_workers() if encode_workers is None else int(encode_workers)
     sampled = batched_sample_moves_masked(
-        gps, model, device, flist, policy_temperature=policy_temperature, generator=generator
+        gps,
+        model,
+        device,
+        flist,
+        policy_temperature=policy_temperature,
+        generator=generator,
+        encode_workers=ew,
     )
     for j, i in enumerate(active):
         moves_out[i] = sampled[j]
