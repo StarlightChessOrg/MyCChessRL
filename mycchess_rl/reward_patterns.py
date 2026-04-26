@@ -1,14 +1,18 @@
+from __future__ import annotations
+
 """非终局战术类奖励塑形：士象、担子炮、双车、过河卒、马、三子归边、中炮、空头炮、车牵炮、将门等（微弱标量）。
 
 性能：棋盘仅 10×9，相对策略/价值网络前向可忽略；本模块用固定坐标网格缓存与 ``numpy`` 切片计数，
 避免每步 ``np.indices`` 分配与部分 Python 环。未使用 Numba：Unicode 棋盘需额外编码才有 nopython 收益，
 默认不增加依赖。
 """
-from __future__ import annotations
 
 import numpy as np
 
 from mycchess_rl.fen_parse import FULL_INIT_FEN, parse_fen_board
+
+# ``train_ppo`` / ``vec_env`` 战术塑形默认系数（与 king_prox 同量级）；单项置 ``0`` 关闭
+DEFAULT_TACTIC_SHAPING_COEFF = 0.004
 
 # 固定 10×9：缓存坐标网格，避免每步 ``np.indices`` 分配（rollout 热路径）
 _GRID_Y = np.arange(10, dtype=np.int16)[:, np.newaxis]

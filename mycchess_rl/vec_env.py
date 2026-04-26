@@ -7,7 +7,7 @@ import numpy as np
 
 from mycchess_rl.encode_parallel import default_encode_workers
 from mycchess_rl.policy_inference import batched_sample_moves_masked, eval_value_stm
-from mycchess_rl.reward_patterns import tactics_shaping_total
+from mycchess_rl.reward_patterns import DEFAULT_TACTIC_SHAPING_COEFF, tactics_shaping_total
 from mycchess_rl.xqwl_state import XqwlGameState
 
 # 吃子塑形：以兵/卒为 1.0 的相对权重（与 ``reward_shaping_capture`` 基量相乘）
@@ -100,19 +100,19 @@ def collect_rollout_step(
     reward_shaping_capture: float = 0.0,
     reward_shaping_king_prox: float = 0.0,
     reward_shaping_step: float = 0.0,
-    reward_shaping_ae_shape: float = 0.0,
-    reward_shaping_double_cannon: float = 0.0,
-    reward_shaping_rook_pair: float = 0.0,
-    reward_shaping_cross_pawn: float = 0.0,
-    reward_shaping_knight_flex: float = 0.0,
-    reward_shaping_three_edge: float = 0.0,
-    reward_shaping_central_cannon: float = 0.0,
-    reward_shaping_open_cannon: float = 0.0,
-    reward_shaping_rook_pin_cannon: float = 0.0,
-    reward_shaping_opp_king_gate: float = 0.0,
-    reward_shaping_miss_adv_double_rook: float = 0.0,
-    reward_shaping_double_adv_king_center: float = 0.0,
-    reward_shaping_king_near_start: float = 0.0,
+    reward_shaping_ae_shape: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_double_cannon: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_rook_pair: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_cross_pawn: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_knight_flex: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_three_edge: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_central_cannon: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_open_cannon: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_rook_pin_cannon: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_opp_king_gate: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_miss_adv_double_rook: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_double_adv_king_center: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_king_near_start: float = DEFAULT_TACTIC_SHAPING_COEFF,
 ) -> tuple[np.ndarray, np.ndarray, list[XqwlGameState], list[str]]:
     """``reward_shaping_*``：稀疏终局奖励下的轻量塑形（**0 关闭**）。
 
@@ -120,9 +120,8 @@ def collect_rollout_step(
     - ``reward_shaping_capture``：吃子基量 × 按子种相对权重（兵=1，车马炮等更高）。
     - ``reward_shaping_check``：对手应将时基量 × ``(0.4 + 0.6×prox)``，``prox`` 为落点与对方将/帅接近度。
     - ``reward_shaping_king_prox``：每步（非终局）额外 ``×prox``，微弱鼓励压将。
-    - ``reward_shaping_ae_shape`` … ``knight_flex``：见 ``reward_patterns.tactics_shaping_total``。
-    - ``three_edge`` / ``central_cannon`` / ``open_cannon`` / ``rook_pin_cannon``：三子归边、中炮、空头炮、车牵炮近似。
-    - ``opp_king_gate`` / ``miss_adv_double_rook`` / ``double_adv_king_center`` / ``king_near_start``：将门封锁、缺士对双车、双士宫心、将归位。
+    - 战术类 ``reward_shaping_*`` 默认 ``reward_patterns.DEFAULT_TACTIC_SHAPING_COEFF``；``0`` 关闭该项。
+    - 详见 ``reward_patterns.tactics_shaping_total``（士象、担子炮、过河卒、将门等）。
     """
     n = vec.n_env
     rewards = np.zeros(n, dtype=np.float32)

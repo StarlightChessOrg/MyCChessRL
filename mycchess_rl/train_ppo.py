@@ -18,6 +18,7 @@ from mycchess_rl.policy_inference import (
     batched_value_expectation,
 )
 from mycchess_rl.ppo import PPOConfig, compute_gae, iccs_to_src_dst_onehot, policy_value_loss_step
+from mycchess_rl.reward_patterns import DEFAULT_TACTIC_SHAPING_COEFF
 from mycchess_rl.vec_env import ParallelXiangqiVecEnv, collect_rollout_step, reset_finished
 
 _LOG = logging.getLogger("mycchess_rl.train_ppo")
@@ -165,80 +166,80 @@ def main() -> None:
     p.add_argument(
         "--reward-shaping-ae-shape",
         type=float,
-        default=0.0,
-        help="士在九宫、象在己方半场的微弱阵型奖系数；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"士象阵型微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-double-cannon",
         type=float,
-        default=0.0,
-        help="己方担子炮（两炮共线、线间恰一子）微弱奖；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"担子炮微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-rook-pair",
         type=float,
-        default=0.0,
-        help="己方双车同横线且间距较大（霸王车近似）微弱奖；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"双车同线微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-cross-pawn",
         type=float,
-        default=0.0,
-        help="过河卒（兵到对方半场 / 卒到己方半场一侧）每步微弱奖；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"过河卒微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-knight-flex",
         type=float,
-        default=0.0,
-        help="走马时按「较好」马步数（靠己方宫心或落边线）微弱奖；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"马灵活性微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-three-edge",
         type=float,
-        default=0.0,
-        help="三子归边近似（车马炮在对方半场一侧翼≥3）；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"三子归边近似（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-central-cannon",
         type=float,
-        default=0.0,
-        help="中炮近似（己炮在 x=4 且未过河）；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"中炮近似，镇马宫心时加倍（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-open-cannon",
         type=float,
-        default=0.0,
-        help="空头炮近似（己炮与对方将同纵线，其间无子或恰一枚对方炮架）；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"空头炮近似（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-rook-pin-cannon",
         type=float,
-        default=0.0,
-        help="车牵炮近似（己车与对方车炮共线且该线仅这三子）；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"车牵炮近似（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-opp-king-gate",
         type=float,
-        default=0.0,
-        help="对方将在九宫内可进空格≤1（将门被堵）时奖走子方；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"对方将门被堵微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-miss-adv-double-rook",
         type=float,
-        default=0.0,
-        help="己方士<2且对方两车：每步减去该系数（惩罚）；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"缺士对双车惩罚强度（默认 {DEFAULT_TACTIC_SHAPING_COEFF}，触发时减去该值）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-double-adv-king-center",
         type=float,
-        default=0.0,
-        help="己方恰双士且将在九宫几何中心；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"双士护宫心（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     p.add_argument(
         "--reward-shaping-king-near-start",
         type=float,
-        default=0.0,
-        help="己将/帅距开局位置越近奖越大（曼哈顿/10）；0=关闭",
+        default=DEFAULT_TACTIC_SHAPING_COEFF,
+        help=f"将帅近开局位（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     args = p.parse_args()
 
