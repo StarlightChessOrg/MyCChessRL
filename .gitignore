@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+cpp/build/
+*.pyd
+*.so
+mycchess_ppo_last.pt
+.pytest_cache/
