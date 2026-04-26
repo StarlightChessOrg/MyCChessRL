@@ -104,13 +104,13 @@ def batched_encode_roots(
 ) -> torch.Tensor:
     if not states:
         return torch.zeros(0, device=device)
-    from mycchess_rl.encode_parallel import encode_states_threaded, resolve_encode_workers
+    from mycchess_rl.encode_parallel import encode_states_parallel, resolve_encode_workers
 
     w = resolve_encode_workers(encode_workers, len(states))
     if w <= 1:
         xs = [_encode_state_current_nchw(g, flist, device) for g in states]
         return torch.cat(xs, dim=0)
-    chw = encode_states_threaded(states, w)
+    chw = encode_states_parallel(states, w)
     return torch.from_numpy(np.ascontiguousarray(chw)).to(device, non_blocking=True)
 
 

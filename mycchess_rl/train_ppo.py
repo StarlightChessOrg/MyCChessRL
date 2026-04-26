@@ -94,7 +94,7 @@ def main() -> None:
         "--encode-workers",
         type=int,
         default=None,
-        help="CPU 特征编码线程数；省略则 min(8, CPU核数)；1=强制单线程",
+        help="CPU 特征编码进程池 worker 数；省略则 min(8, CPU核数)；1=主进程内顺序编码（不用进程池）",
     )
     p.add_argument(
         "--ppo-mini-batch",
@@ -141,7 +141,7 @@ def main() -> None:
         name = torch.cuda.get_device_name(idx)
         _LOG.info("CUDA 设备: [%d] %s", idx, name)
     _LOG.info(
-        "特征编码 encode_workers=%d | PPO mini-batch=%d",
+        "特征编码 encode_workers(进程池)=%d | PPO mini-batch=%d",
         enc_w,
         int(args.ppo_mini_batch),
     )
