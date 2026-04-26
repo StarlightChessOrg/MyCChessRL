@@ -18,13 +18,13 @@ def main() -> None:
     p.add_argument(
         "--n-env",
         type=int,
-        default=192,
-        help="并行环境数（默认可喂满 A100 40GB 类 GPU 的批推理）",
+        default=384,
+        help="并行环境数（增大可抬高 GPU 占用；显存不够时再调小）",
     )
     p.add_argument(
         "--steps",
         type=int,
-        default=128,
+        default=192,
         help="每次更新前每个环境收集的步数（与 --n-env 相乘为每轮样本量上界）",
     )
     p.add_argument(
@@ -69,7 +69,8 @@ def main() -> None:
         val_buf = np.zeros((T, N), dtype=np.float32)
 
         with torch.no_grad():
-            v_cur = batched_value_expectation([s.game for s in vec.slots], model, device, flist).cpu().numpy()
+            v_cur = batched_value_expectation([s.game for s in vec.slots], model, device, flist)
+            v_cur = v_cur.detach().float().cpu().numpy()
 
         for t in range(T):
             gps_pre = [s.game for s in vec.slots]
@@ -85,18 +86,20 @@ def main() -> None:
             done_buf[t] = done
 
             with torch.no_grad():
-                v_cur = batched_value_expectation([s.game for s in vec.slots], model, device, flist).cpu().numpy()
+                v_cur = batched_value_expectation([s.game for s in vec.slots], model, device, flist)
+                v_cur = v_cur.detach().float().cpu().numpy()
             reset_finished(vec, done)
 
         with torch.no_grad():
-            last_v = batched_value_expectation([s.game for s in vec.slots], model, device, flist).cpu().numpy()
+            last_v = batched_value_expectation([s.game for s in vec.slots], model, device, flist)
+            last_v = last_v.detach().float().cpu().numpy()
         adv, ret = compute_gae(rew_buf, val_buf, done_buf, last_v, gamma=cfg.gamma, lam=cfg.gae_lambda)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         obs_list: list = []
+        mv_list: list[str] = []
         src_list: list[torch.Tensor] = []
         dst_list: list[torch.Tensor] = []
-        old_logp_list: list[float] = []
         old_v_list: list[float] = []
         adv_list: list[float] = []
         ret_list: list[float] = []
@@ -108,14 +111,10 @@ def main() -> None:
                 if not isinstance(mv, str) or len(mv) < 5:
                     continue
                 obs_list.append(g)
+                mv_list.append(mv)
                 oh_s, oh_d = iccs_to_src_dst_onehot(mv, device, torch.float32)
                 src_list.append(oh_s)
                 dst_list.append(oh_d)
-                with torch.no_grad():
-                    lp = float(
-                        two_stage_logprob_on_move(g, model, device, flist, mv, policy_temperature=1.0).cpu()
-                    )
-                old_logp_list.append(lp)
                 old_v_list.append(float(val_buf[t, i]))
                 adv_list.append(float(adv[t, i]))
                 ret_list.append(float(ret[t, i]))
@@ -124,12 +123,28 @@ def main() -> None:
             continue
 
         xb = batched_encode_roots(obs_list, flist, device)
+        with torch.no_grad():
+            model.eval()
+            feat_roll = model._trunk_flat(xb)
+            old_lp_rows: list[float] = []
+            for fi in range(feat_roll.shape[0]):
+                lp = two_stage_logprob_on_move(
+                    obs_list[fi],
+                    model,
+                    device,
+                    flist,
+                    mv_list[fi],
+                    policy_temperature=1.0,
+                    feat_1_row=feat_roll[fi : fi + 1],
+                )
+                old_lp_rows.append(float(lp.cpu()))
+        old_lp = torch.tensor(old_lp_rows, device=device, dtype=torch.float32)
+
         src_b = torch.stack(src_list, dim=0)
         dst_b = torch.stack(dst_list, dim=0)
-        old_lp = torch.tensor(old_logp_list, device=device)
-        old_v = torch.tensor(old_v_list, device=device)
         adv_b = torch.clamp(torch.tensor(adv_list, device=device), -5.0, 5.0)
         ret_b = torch.clamp(torch.tensor(ret_list, device=device), -10.0, 10.0)
+        old_v = torch.tensor(old_v_list, device=device)
 
         loss = policy_value_loss_step(model, opt, xb, src_b, dst_b, old_lp, adv_b, ret_b, old_v, cfg)
         if upd % 10 == 0:

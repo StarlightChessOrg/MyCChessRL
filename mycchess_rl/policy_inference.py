@@ -9,7 +9,6 @@ from mycchess_rl.chess.rationale import (
     POLICY_GRID_NUMEL,
     STM_VALUE_TERMINAL_DRAW,
     STM_VALUE_TERMINAL_LOSS,
-    stm_value_expectation_from_win_draw_loss_probs,
 )
 from mycchess_rl.model import SuccessorPolicy, policy_temperature_scalar
 from mycchess_rl.xqwl_state import XqwlGameState
@@ -67,6 +66,15 @@ def infer_greedy_move_string(
     return f"{sx}{sy}-{dx}{dy}"
 
 
+def _scalar_value_from_logits_v(logits_v: torch.Tensor) -> torch.Tensor:
+    """(3,) 或 (B,3) → 标量或 (B,) 行棋方价值期望。"""
+    pv = torch.softmax(logits_v.float(), dim=-1)
+    w = torch.tensor([3.0, 1.0, -3.0], device=logits_v.device, dtype=pv.dtype)
+    if pv.dim() == 1:
+        return (pv * w).sum()
+    return (pv * w).sum(dim=-1)
+
+
 @torch.no_grad()
 def eval_value_stm(
     state: XqwlGameState,
@@ -83,12 +91,7 @@ def eval_value_stm(
     model.eval()
     feat = model._trunk_flat(x_cur)
     logits_v = model.value_head(feat)[0]
-    pv = torch.softmax(logits_v.float(), dim=0)
-    return float(
-        stm_value_expectation_from_win_draw_loss_probs(
-            float(pv[0].item()), float(pv[1].item()), float(pv[2].item())
-        )
-    )
+    return float(_scalar_value_from_logits_v(logits_v).item())
 
 
 def batched_encode_roots(
@@ -153,6 +156,7 @@ def two_stage_logprob_on_move(
     iccs: str,
     *,
     policy_temperature: float = 1.0,
+    feat_1_row: torch.Tensor | None = None,
 ) -> torch.Tensor:
     T = policy_temperature_scalar(policy_temperature)
     x1, y1, x2, y2 = int(iccs[0]), int(iccs[1]), int(iccs[3]), int(iccs[4])
@@ -162,9 +166,12 @@ def two_stage_logprob_on_move(
     src_mask = torch.zeros(POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
     for a, b, _, _ in legals_t:
         src_mask[b * 9 + a] = True
-    x_cur = _encode_state_current_nchw(state, flist, device)
     model.eval()
-    feat = model._trunk_flat(x_cur)
+    if feat_1_row is None:
+        x_cur = _encode_state_current_nchw(state, flist, device)
+        feat = model._trunk_flat(x_cur)
+    else:
+        feat = feat_1_row
     ls = model.head_src(feat)[0]
     log_p_src = torch.log_softmax((ls / T).masked_fill(~src_mask, -1e9), dim=0)
     oh = torch.zeros(1, POLICY_GRID_NUMEL, device=device, dtype=feat.dtype)
@@ -185,5 +192,29 @@ def batched_value_expectation(
     device: torch.device,
     flist: dict[str, list[str]],
 ) -> torch.Tensor:
-    xs = [eval_value_stm(g, model, device, flist) for g in states]
-    return torch.tensor(xs, device=device, dtype=torch.float32)
+    """单次 ``_trunk_flat`` 批前向，避免逐环境调用 ``eval_value_stm`` 导致 GPU 吃不饱。"""
+    n = len(states)
+    if n == 0:
+        return torch.zeros(0, device=device, dtype=torch.float32)
+    out = torch.empty(n, device=device, dtype=torch.float32)
+    active: list[int] = []
+    active_states: list[XqwlGameState] = []
+    for i, g in enumerate(states):
+        if not g.legal_moves_iccs_str():
+            t, r = g.terminal()
+            if t and r == "checkmate":
+                out[i] = float(STM_VALUE_TERMINAL_LOSS)
+            else:
+                out[i] = float(STM_VALUE_TERMINAL_DRAW)
+        else:
+            active.append(i)
+            active_states.append(g)
+    if active_states:
+        model.eval()
+        xb = batched_encode_roots(active_states, flist, device)
+        feat = model._trunk_flat(xb)
+        logits_v = model.value_head(feat)
+        vals = _scalar_value_from_logits_v(logits_v)
+        for j, idx in enumerate(active):
+            out[idx] = vals[j]
+    return out
