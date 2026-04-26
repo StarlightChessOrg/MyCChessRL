@@ -54,7 +54,7 @@ mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 
 **数据准备并行**：`mycchess_rl/encode_parallel.py` 用线程池对局面 **14 平面编码**（默认 `min(8, CPU核数)`，可用 `--encode-workers` 覆盖；`1` 为单线程）。采样阶段对 **整批** 计算 `head_dst`，不再对每个环境单独做一次小矩阵乘。
 
-默认训练超参面向 **约 24 核 CPU、64GB 内存、单卡 A100 40GB**（例如 `--n-env 384 --steps 192 --updates 800`）；价值估计与 rollout 旧对数概率均尽量 **批前向** 以提高 GPU 利用率。显存或速度不够时再调小 `--n-env` / `--steps`。
+默认训练超参面向 **约 24 核 CPU、64GB 内存、单卡 A100 40GB**（例如 `--n-env 384 --steps 192 --updates 800`）；价值估计与 rollout 旧对数概率均尽量 **批前向** 以提高 GPU 利用率。优化阶段若整批前向（样本数 ≈ `n_env × steps`）会占满激活显存，可用 **`--ppo-mini-batch`**（默认 4096）按小批 **梯度累积** 做 PPO 反向，峰值显存随该值近似线性变化；仍 OOM 时再调小 `--ppo-mini-batch`、`--n-env` 或 `--steps`。
 
 ## 特征说明
 

@@ -96,6 +96,12 @@ def main() -> None:
         default=None,
         help="CPU 特征编码线程数；省略则 min(8, CPU核数)；1=强制单线程",
     )
+    p.add_argument(
+        "--ppo-mini-batch",
+        type=int,
+        default=4096,
+        help="PPO 反向时 GPU mini-batch 大小；整轮样本可达数万，过小则慢、过大易 OOM（A100 40GB 建议 2048~8192）",
+    )
     args = p.parse_args()
 
     _setup_logging(args.log_file)
@@ -134,7 +140,11 @@ def main() -> None:
         idx = device.index if device.index is not None else 0
         name = torch.cuda.get_device_name(idx)
         _LOG.info("CUDA 设备: [%d] %s", idx, name)
-    _LOG.info("特征编码 encode_workers=%d（线程池 + 采样整批 head_dst）", enc_w)
+    _LOG.info(
+        "特征编码 encode_workers=%d | PPO mini-batch=%d",
+        enc_w,
+        int(args.ppo_mini_batch),
+    )
 
     cfg = PPOConfig(lr=args.lr)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
@@ -276,6 +286,9 @@ def main() -> None:
                 device,
                 policy_temperature=1.0,
             )
+            del feat_roll
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         _LOG.info(
             "[ppo] update %d old_logp 完成 elapsed=%.2fs，开始反向更新",
             upd,
@@ -288,7 +301,19 @@ def main() -> None:
         ret_b = torch.clamp(torch.tensor(ret_list, device=device), -10.0, 10.0)
         old_v = torch.tensor(old_v_list, device=device)
 
-        loss, m = policy_value_loss_step(model, opt, xb, src_b, dst_b, old_lp, adv_b, ret_b, old_v, cfg)
+        loss, m = policy_value_loss_step(
+            model,
+            opt,
+            xb,
+            src_b,
+            dst_b,
+            old_lp,
+            adv_b,
+            ret_b,
+            old_v,
+            cfg,
+            mini_batch_size=int(args.ppo_mini_batch),
+        )
         t_opt1 = time.perf_counter()
         optimize_s = t_opt1 - t_opt0
         upd_s = time.perf_counter() - t_upd0
