@@ -335,7 +335,7 @@ def main() -> None:
                 upd,
                 feat_roll.shape[0],
             )
-            old_lp = batched_two_stage_logprob_on_moves(
+            old_lp, src_ok_b, dst_ok_b = batched_two_stage_logprob_on_moves(
                 obs_list,
                 mv_list,
                 feat_roll,
@@ -374,8 +374,11 @@ def main() -> None:
             old_v,
             cfg,
             mini_batch_size=int(args.ppo_mini_batch),
+            policy_temperature=1.0,
+            src_legal_mask=src_ok_b,
+            dst_legal_mask=dst_ok_b,
         )
-        del xb, src_b, dst_b, old_lp, adv_b, ret_b, old_v
+        del xb, src_b, dst_b, old_lp, adv_b, ret_b, old_v, src_ok_b, dst_ok_b
         obs_list.clear()
         mv_list.clear()
         adv_list.clear()

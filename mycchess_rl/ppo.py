@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from mycchess_rl.model import SuccessorPolicy
+from mycchess_rl.model import SuccessorPolicy, policy_temperature_scalar
 
 
 @dataclass
@@ -60,11 +60,39 @@ def _ppo_forward_loss(
     ret_value: torch.Tensor,
     old_v: torch.Tensor,
     cfg: PPOConfig,
+    *,
+    policy_temperature: float = 1.0,
+    src_legal_mask: torch.Tensor | None = None,
+    dst_legal_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """一次前向：返回可反传的 ``loss`` 及 detached 日志字典（对该 mini-batch 的 mean）。"""
+    """一次前向：返回可反传的 ``loss`` 及 detached 日志字典（对该 mini-batch 的 mean）。
+
+    当提供 ``src_legal_mask``/``dst_legal_mask`` 时，与 ``batched_two_stage_logprob_on_moves`` 相同：
+    ``logits/T`` 后仅在合法着法维上做 ``log_softmax``；否则退化为全 90 维（与旧行为一致）。
+    """
+    T = policy_temperature_scalar(policy_temperature)
     logits_s, logits_d, logits_v = model(obs, src_oh)
-    logp_s = (F.log_softmax(logits_s, dim=1) * src_oh).sum(dim=1)
-    logp_d = (F.log_softmax(logits_d, dim=1) * dst_oh).sum(dim=1)
+    scaled_s = logits_s / T
+    scaled_d = logits_d / T
+
+    if src_legal_mask is not None:
+        ls_m = scaled_s.masked_fill(~src_legal_mask, -1e9)
+        logp_s = (F.log_softmax(ls_m, dim=1) * src_oh).sum(dim=1)
+        p_s = F.softmax(ls_m, dim=1)
+        ent_s = (-(p_s * F.log_softmax(ls_m, dim=1)).sum(1)).mean()
+    else:
+        logp_s = (F.log_softmax(logits_s, dim=1) * src_oh).sum(dim=1)
+        ent_s = (-(F.softmax(logits_s, 1) * F.log_softmax(logits_s, 1)).sum(1)).mean()
+
+    if dst_legal_mask is not None:
+        ld_m = scaled_d.masked_fill(~dst_legal_mask, -1e9)
+        logp_d = (F.log_softmax(ld_m, dim=1) * dst_oh).sum(dim=1)
+        p_d = F.softmax(ld_m, dim=1)
+        ent_d = (-(p_d * F.log_softmax(ld_m, dim=1)).sum(1)).mean()
+    else:
+        logp_d = (F.log_softmax(logits_d, dim=1) * dst_oh).sum(dim=1)
+        ent_d = (-(F.softmax(logits_d, 1) * F.log_softmax(logits_d, 1)).sum(1)).mean()
+
     logp = torch.clamp(logp_s + logp_d, -80.0, 0.0)
     old_logp_c = torch.clamp(old_logp, -80.0, 0.0)
     ratio = torch.exp(torch.clamp(logp - old_logp_c, -5.0, 5.0))
@@ -74,8 +102,6 @@ def _ppo_forward_loss(
     pol_loss = -torch.min(surr1, surr2).mean()
     v_pred = value_expectation_from_logits(logits_v)
     v_loss = F.smooth_l1_loss(v_pred, ret_value, beta=0.5)
-    ent_s = (-(F.softmax(logits_s, 1) * F.log_softmax(logits_s, 1)).sum(1)).mean()
-    ent_d = (-(F.softmax(logits_d, 1) * F.log_softmax(logits_d, 1)).sum(1)).mean()
     ent = ent_s + ent_d
     loss = pol_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent
 
@@ -113,6 +139,9 @@ def policy_value_loss_step(
     cfg: PPOConfig,
     *,
     mini_batch_size: int | None = None,
+    policy_temperature: float = 1.0,
+    src_legal_mask: torch.Tensor | None = None,
+    dst_legal_mask: torch.Tensor | None = None,
 ) -> tuple[float, dict[str, float]]:
     """
     PPO 更新。``mini_batch_size`` 为 None 或 ≥ N 时整批一次前向；
@@ -128,7 +157,20 @@ def policy_value_loss_step(
 
     mbs = n if mini_batch_size is None else max(1, int(mini_batch_size))
     if mbs >= n:
-        loss, dbg = _ppo_forward_loss(model, obs, src_oh, dst_oh, old_logp, adv, ret_value, old_v, cfg)
+        loss, dbg = _ppo_forward_loss(
+            model,
+            obs,
+            src_oh,
+            dst_oh,
+            old_logp,
+            adv,
+            ret_value,
+            old_v,
+            cfg,
+            policy_temperature=policy_temperature,
+            src_legal_mask=src_legal_mask,
+            dst_legal_mask=dst_legal_mask,
+        )
         opt.zero_grad()
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
@@ -166,6 +208,8 @@ def policy_value_loss_step(
     for start in range(0, n, mbs):
         end = min(start + mbs, n)
         w = (end - start) / n
+        sm = None if src_legal_mask is None else src_legal_mask[start:end]
+        dm = None if dst_legal_mask is None else dst_legal_mask[start:end]
         loss_mb, dbg = _ppo_forward_loss(
             model,
             obs[start:end],
@@ -176,6 +220,9 @@ def policy_value_loss_step(
             ret_value[start:end],
             old_v[start:end],
             cfg,
+            policy_temperature=policy_temperature,
+            src_legal_mask=sm,
+            dst_legal_mask=dm,
         )
         (loss_mb * w).backward()
         acc_loss_log += float(loss_mb.detach().cpu()) * w
