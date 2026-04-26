@@ -15,9 +15,24 @@ from mycchess_rl.vec_env import ParallelXiangqiVecEnv, collect_rollout_step, res
 
 def main() -> None:
     p = argparse.ArgumentParser(description="MyCChessRL 并行 PPO 自对弈（规则：xqwl_core）")
-    p.add_argument("--n-env", type=int, default=32, help="并行环境数")
-    p.add_argument("--steps", type=int, default=64, help="每次更新前收集的并行步数")
-    p.add_argument("--updates", type=int, default=100, help="PPO 更新次数")
+    p.add_argument(
+        "--n-env",
+        type=int,
+        default=192,
+        help="并行环境数（默认可喂满 A100 40GB 类 GPU 的批推理）",
+    )
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=128,
+        help="每次更新前每个环境收集的步数（与 --n-env 相乘为每轮样本量上界）",
+    )
+    p.add_argument(
+        "--updates",
+        type=int,
+        default=800,
+        help="PPO 更新轮数（单机强 GPU 可拉长总训练）",
+    )
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--checkpoint", type=Path, default=None, help="从已有权重微调；省略则随机初始化")
     p.add_argument("--lr", type=float, default=3e-4)

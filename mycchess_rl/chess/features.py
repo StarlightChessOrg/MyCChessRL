@@ -1,13 +1,14 @@
-"""盘面到模型输入的平面特征编码。"""
+"""盘面到模型输入的平面特征编码。
+
+根张量与 `icyElephant` 的 ``game_convert`` / ``gameplay.get_board_arr`` 一致：14 路二值
+棋子平面（行棋方子类在前），黑方行棋时对行维做 ``[:,::-1,:]`` 翻转，见
+https://github.com/bupticybee/icyElephant/blob/master/game_convert.py
+"""
 from __future__ import annotations
 
 from typing import Mapping
 
 import numpy as np
-
-from mycchess_rl.chess.plane_extras import encode_extra_hint_planes
-from mycchess_rl.chess.rationale import encode_rationale_planes
-from mycchess_rl.iccs_util import parse_move_squares
 
 FEATURE_LIST: dict[str, list[str]] = {
     "red": ["A", "B", "C", "K", "N", "P", "R"],
@@ -67,15 +68,8 @@ def encode_model_planes(
     move_index: int | None = None,
     feature_list: Mapping[str, list[str]] | None = None,
 ) -> np.ndarray:
-    _ = feature_list
-    pieces = encode_signed_seven_planes(boardarr)
-    rationale = encode_rationale_planes(boardarr, red_to_move, in_check, legal_iccs)
-    extra = encode_extra_hint_planes(
-        boardarr,
-        red_to_move,
-        legal_iccs=legal_iccs,
-        in_check=in_check,
-        move_index=move_index,
-        last_move=last_move,
-    )
-    return np.concatenate([pieces, rationale, extra], axis=0)
+    """icyElephant 风格 14 路根特征；其余参数仅为 API 兼容保留。"""
+    _ = (legal_iccs, in_check, last_move, move_index)
+    fl = FEATURE_LIST if feature_list is None else feature_list
+    picker_u8 = encode_picker_planes(boardarr, red_to_move, fl)
+    return orient_planes_for_model(picker_u8, red_to_move).astype(np.float32, copy=False)

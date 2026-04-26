@@ -3,6 +3,6 @@ numpy>=1.24
 torch>=2.1
 
 # 网页对弈
-flask>=2.3
+sanic>=23.12
 
 # C++ 扩展 xqwl_core 需本地 CMake 编译安装，无 pip 包名

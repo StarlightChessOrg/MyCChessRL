@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-play = ["flask>=2.3"]
+play = ["sanic>=23.12"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]

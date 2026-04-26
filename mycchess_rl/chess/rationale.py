@@ -7,8 +7,6 @@ import numpy as np
 
 from mycchess_rl.iccs_util import parse_move_squares
 from mycchess_rl.piece_types import ChessSide, PieceT, fench_to_species
-from mycchess_rl.chess.plane_extras import EXTRA_HINT_PLANE_COUNT
-
 PIECE_VALUE_BY_FENCH: dict[str, float] = {
     "r": 9.0,
     "n": 4.0,
@@ -22,7 +20,8 @@ PIECE_VALUE_BY_FENCH: dict[str, float] = {
 PIECE_PLANE_COUNT = 14
 RATIONALE_PLANE_COUNT = 11
 PIECE_SIGNED_PLANE_COUNT = 7
-POLICY_SELECT_IN_CHANNELS = PIECE_SIGNED_PLANE_COUNT + RATIONALE_PLANE_COUNT + EXTRA_HINT_PLANE_COUNT
+# 与 icyElephant 根输入一致（14 路二值棋子平面）；非旧版 7+11+47 融合。
+POLICY_SELECT_IN_CHANNELS = PIECE_PLANE_COUNT
 POLICY_MAX_LEGAL_MOVES = 96
 POLICY_GRID_NUMEL = 90
 

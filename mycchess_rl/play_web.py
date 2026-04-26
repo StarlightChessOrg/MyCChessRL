@@ -1,14 +1,15 @@
-"""网页对弈（Flask）；规则与特征均依赖 ``xqwl_core``。"""
+"""网页对弈（Sanic）；规则与特征均依赖 ``xqwl_core``。"""
 from __future__ import annotations
 
 import argparse
+import asyncio
 import threading
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from mycchess_rl.chess.features import parse_move_squares
+from mycchess_rl.iccs_util import parse_move_squares
 from mycchess_rl.chess.session import GamePlay
 from mycchess_rl.model import load_successor_policy_for_play
 from mycchess_rl.policy_inference import infer_greedy_move_string
@@ -253,7 +254,7 @@ def _html_page() -> str:
     <div class="board-wrap"><div class="board-card"><div class="board" id="board"></div></div></div>
     <div class="sidepanel">
       <h1>MyCChessRL 象棋对弈</h1>
-      <div class="subtitle">XQWL 规则核 · 两阶段策略网络</div>
+      <div class="subtitle">XQWL 规则核 · Sanic · 两阶段策略网络</div>
       <label>红方策略</label><select id="sel-red"></select>
       <label>黑方策略</label><select id="sel-black"></select>
       <button type="button" id="btn-new">新局</button>
@@ -301,8 +302,8 @@ def _html_page() -> str:
     pollTimer=null;
     Promise.all([fetch("/api/state",{cache:"no-store"}).then(function(r){return r.json();}),
       fetch("/api/messages",{cache:"no-store"}).then(function(r){return r.json();})])
-      .then(function(pair){applySnap(pair[0]);handleMessages(pair[1]);armPoll(pair[0].ai_busy?200:520);})
-      .catch(function(){armPoll(900);});
+      .then(function(pair){applySnap(pair[0]);handleMessages(pair[1]);armPoll(pair[0].ai_busy?160:380);})
+      .catch(function(){armPoll(700);});
   }
   boardEl.addEventListener("click",function(ev){
     var cell=(ev.target.closest&&ev.target.closest(".cell"))||null;
@@ -310,21 +311,21 @@ def _html_page() -> str:
     var ix=parseInt(cell.dataset.ix,10),iy=parseInt(cell.dataset.iy,10);
     if(isNaN(ix)||isNaN(iy))return;
     fetch("/api/click",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ix:ix,iy:iy})})
-      .then(function(r){return r.json();}).then(function(j){if(j.error)showAlert("走子",j.error);else armPoll(35);}).catch(function(){armPoll(35);});
+      .then(function(r){return r.json();}).then(function(j){if(j.error)showAlert("走子",j.error);else armPoll(25);}).catch(function(){armPoll(25);});
   });
   selRed.addEventListener("change",function(){
     fetch("/api/strategies",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({red:selRed.value,black:selBlack.value})}).then(function(r){return r.json();})
-      .then(function(j){if(j.error)showAlert("策略",j.error);else armPoll(35);});
+      .then(function(j){if(j.error)showAlert("策略",j.error);else armPoll(25);});
   });
   selBlack.addEventListener("change",function(){
     fetch("/api/strategies",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({red:selRed.value,black:selBlack.value})}).then(function(r){return r.json();})
-      .then(function(j){if(j.error)showAlert("策略",j.error);else armPoll(35);});
+      .then(function(j){if(j.error)showAlert("策略",j.error);else armPoll(25);});
   });
   btnNew.addEventListener("click",function(){
     fetch("/api/new_game",{method:"POST"}).then(function(r){return r.json();})
-      .then(function(j){if(j.error)showAlert("新局",j.error);else armPoll(35);});
+      .then(function(j){if(j.error)showAlert("新局",j.error);else armPoll(25);});
   });
   onePoll();
 })();
@@ -335,63 +336,80 @@ def _html_page() -> str:
 
 def main() -> None:
     try:
-        from flask import Flask, Response, jsonify, request
+        from sanic import Sanic
+        from sanic.response import html, json
     except ImportError as e:
-        raise SystemExit("请安装: pip install 'flask>=2.3' 或 pip install -e '.[play]'") from e
+        raise SystemExit("请安装: pip install 'sanic>=23.12' 或 pip install -e '.[play]'") from e
 
-    p = argparse.ArgumentParser(description="MyCChessRL 网页对弈")
+    p = argparse.ArgumentParser(description="MyCChessRL 网页对弈（Sanic）")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--workers", type=int, default=1, help="Sanic worker 数（>1 时勿依赖本进程内单会话）")
     args = p.parse_args()
 
     device = _select_device(int(args.gpu))
     model, flist = load_successor_policy_for_play(args.checkpoint, device)
     session = XqwlWebSession(model, device, flist)
 
-    app = Flask(__name__)
+    app = Sanic("mycchess_rl_play_web")
+    app.config.RESPONSE_TIMEOUT = 120
 
     @app.get("/")
-    def index():
-        return Response(_html_page(), mimetype="text/html; charset=utf-8")
+    async def _index(_request):
+        return html(_html_page())
 
     @app.get("/api/state")
-    def api_state():
-        return jsonify(session.snapshot())
+    async def _api_state(_request):
+        return json(session.snapshot())
 
     @app.get("/api/messages")
-    def api_messages():
-        return jsonify(session.pop_client_messages())
+    async def _api_messages(_request):
+        return json(session.pop_client_messages())
 
     @app.post("/api/click")
-    def api_click():
-        data = request.get_json(silent=True) or {}
+    async def _api_click(request):
+        data = request.json
+        if not isinstance(data, dict):
+            return json({"error": "无效 JSON"}, status=400)
         try:
             ix = int(data.get("ix", -1))
             iy = int(data.get("iy", -1))
         except (TypeError, ValueError):
-            return jsonify({"error": "坐标无效"}), 400
+            return json({"error": "坐标无效"}, status=400)
         err = session.click_cell(ix, iy)
-        return jsonify(err or {})
+        return json(err or {})
 
     @app.post("/api/strategies")
-    def api_strategies():
-        data = request.get_json(silent=True) or {}
+    async def _api_strategies(request):
+        data = request.json
+        if not isinstance(data, dict):
+            return json({"error": "参数无效"}, status=400)
         red, black = data.get("red"), data.get("black")
         if not isinstance(red, str) or not isinstance(black, str):
-            return jsonify({"error": "参数无效"}), 400
+            return json({"error": "参数无效"}, status=400)
         err = session.set_strategies(red, black)
-        return jsonify(err or {})
+        return json(err or {})
 
     @app.post("/api/new_game")
-    def api_new_game():
+    async def _api_new_game(_request):
         err = session.new_game()
-        return jsonify(err or {})
+        return json(err or {})
 
-    threading.Timer(0.25, session.maybe_ai).start()
-    print(f"[play] http://{args.host}:{args.port}/", flush=True)
-    app.run(host=args.host, port=int(args.port), threaded=True)
+    @app.after_server_start
+    async def _kick_ai(_app, _loop):
+        await asyncio.sleep(0.2)
+        session.maybe_ai()
+
+    print(f"[play] http://{args.host}:{args.port}/  (Sanic workers={args.workers})", flush=True)
+    app.run(
+        host=str(args.host),
+        port=int(args.port),
+        workers=int(args.workers),
+        access_log=False,
+        motd=False,
+    )
 
 
 if __name__ == "__main__":

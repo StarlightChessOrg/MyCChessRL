@@ -6,8 +6,8 @@ from mycchess_rl.chess.features import (
     encode_picker_planes,
     encode_signed_seven_planes,
     orient_planes_for_model,
-    parse_move_squares,
 )
+from mycchess_rl.iccs_util import parse_move_squares
 from mycchess_rl.chess.plane_extras import EXTRA_HINT_PLANE_COUNT, encode_extra_hint_planes
 from mycchess_rl.chess.rationale import (
     PIECE_PLANE_COUNT,

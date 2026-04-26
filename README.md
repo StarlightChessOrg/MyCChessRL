@@ -1,13 +1,13 @@
 # MyCChessRL
 
-中国象棋强化学习实践：**规则与合法着法仅通过本地编译的 `xqwl_core`（象棋小巫师 XQWL06 核心）提供**，不依赖 `cchess` 或其它 Python 棋规库。神经网络为与 MyElephant 一致的 **两阶段 ICCS 策略 + 行棋方三分类价值头**；特征平面在纯 NumPy 路径下由当前 FEN 与 **当前方合法 ICCS 列表** 计算。
+中国象棋强化学习实践：**规则与合法着法仅通过本地编译的 `xqwl_core`（象棋小巫师 XQWL06 核心）提供**，不依赖 `cchess` 或其它 Python 棋规库。神经网络为 **两阶段 ICCS 策略 + 行棋方三分类价值头**；**根输入 14 路棋子平面**与 [icyElephant](https://github.com/bupticybee/icyElephant) 的 `game_convert.py` / `gameplay.py` 一致（行棋方子类在前，黑方时垂直翻转），而非旧版 MyElephant 式 7+11+47 融合平面。
 
 ## 依赖
 
 - **Python**：≥ 3.10  
 - **NumPy、PyTorch**：见 `requirements.txt` 或与 `pyproject.toml` 同步。  
 - **`xqwl_core`**：C++17 扩展（pybind11），**必须**自行编译并加入 `PYTHONPATH` 或安装到当前环境。训练、并行环境与对弈等入口在导入 `mycchess_rl.xqwl_state` 时需要该模块；仅使用 `mycchess_rl.chess` 等纯 NumPy 子模块可不装。  
-- **网页对弈**：`flask`（`pip install -r requirements.txt` 或 `pip install -e ".[play]"`）。
+- **网页对弈**：`sanic`（`pip install -r requirements.txt` 或 `pip install -e ".[play]"`）。
 
 ```bash
 pip install -r requirements.txt
@@ -39,18 +39,22 @@ cmake --build . --config Release
 | `mycchess_rl/policy_inference.py` | 贪心 / 批采样 / 价值 / PPO 用 `log π` |
 | `mycchess_rl/vec_env.py` | 并行环境步进 |
 | `mycchess_rl/train_ppo.py` | PPO 示意训练 |
-| `mycchess_rl/play_web.py` | Flask 网页对弈 |
+| `mycchess_rl/play_web.py` | Sanic 网页对弈 |
 
 ## 训练与对弈
 
 ```bash
-python -m mycchess_rl.train_ppo --n-env 32 --steps 64 --updates 100
+python -m mycchess_rl.train_ppo
 mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8765
 ```
 
+默认训练超参面向 **约 24 核 CPU、64GB 内存、单卡 A100 40GB**（例如 `--n-env 192 --steps 128 --updates 800`），可按机器再调。
+
 ## 特征说明
 
-部分「对方着法并集 / 对方吃子目标」等平面在无对方独立引擎枚举时填 **零**，通道维数仍为 **7 + 11 + 47**，与旧 checkpoint 形状兼容；若需完全复刻 MyElephant 数值，可后续在 `xqwl_core` 中增加「指定行棋方生成合法着」接口再接通。
+ResNet 茎输入为 **14×10×9**（与 icyElephant 数据管线一致）。icy 原版第二阶段曾用 **15 路**（14 棋子 + 1 路起点掩码）喂第二个卷积塔；本仓库仍用 **单塔 trunk**，仅在全连接 `head_dst` 处拼接起点 one-hot，与 icy 的卷积分塔不完全相同，但**棋盘侧张量**已与 icy 对齐。曾用 **65 通道** 旧权重与当前 `stem_conv` **不兼容**，需重新训练。
+
+`mycchess-play-web` 支持 `--workers`（默认 1）；多 worker 时每个进程独立内存，**不宜**与单进程共享会话的用法混用。
 
 ## 许可证
 

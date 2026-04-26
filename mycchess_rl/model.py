@@ -1,4 +1,4 @@
-"""与 MyElephant / icyElephant 一致的两阶段策略塔（起点 + 落点 + 行棋方三分类价值）。"""
+"""两阶段策略塔（起点 + 落点 + 行棋方三分类价值）；根卷积输入通道与 icyElephant 14 路棋子平面一致。"""
 from __future__ import annotations
 
 import math
