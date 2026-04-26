@@ -55,7 +55,9 @@ mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 
 **中途存盘**：默认 **`--save-dir runs`**，每 **`--save-every`** 轮（默认 **50**）写入 `runs/ppo_upd_000049.pt` 等（完成第 `upd` 轮后，当 `(upd+1)` 整除 `save_every` 时保存）；训练结束再写 **`runs/mycchess_ppo_last.pt`**。`--save-every 0` 则仅写 `last`。checkpoint 内含 `model`、`in_channels`、可选 `update`，与 `--checkpoint` 微调加载格式一致。
 
-**奖励塑形（初期易瞎逛时）**：`--reward-shaping-step`（默认小负数）在非终局每步施加轻微时间压力；`--reward-shaping-check`（默认小正数）在对手被将军时给额外奖；`--reward-shaping-capture`（默认小正数）在**吃子**时给额外奖（走子前终点格有对方子）。将死仍 **+1**、和棋/规则终局仍 **0**，塑形只加在「未将死」的步上。若要与纯终局一致，将 **check / capture / step** 三者均设为 **0**。
+**奖励塑形（初期易瞎逛时）**：`--reward-shaping-step`（默认小负数）时间压力；`--reward-shaping-king-prox` 按落点与对方将/帅**接近度**（曼哈顿，归一化到 [0,1]）给微弱奖；`--reward-shaping-check` 在对手**应将**时给奖，并随接近度在 **0.4~1.0** 倍缩放；`--reward-shaping-capture` 为吃子基量，**兵卒=1×**，象士、马、炮、车、将（若出现）权重递增（见 ``vec_env._CAPTURE_MULT``）。将死仍 **+1**。全关：四个参数均 **0**。
+
+**可选战术微弱塑形**（默认 **0** 关闭，实现见 ``mycchess_rl/reward_patterns.py``）：`--reward-shaping-ae-shape`（士在九宫、象在己方半场）；`--reward-shaping-double-cannon`（担子炮）；`--reward-shaping-rook-pair`（双车同横线且间距较大）；`--reward-shaping-cross-pawn`（过河卒）；`--reward-shaping-knight-flex`（刚走动为马时，按棋盘**伪合法**马步中「较好」马步数计分）。另有 `--reward-shaping-three-edge`（三子归边：车马炮在对方半场一侧翼 x≤2 或 x≥6 上≥3 枚）、`--reward-shaping-central-cannon`（中炮：己炮在 x=4 且未过河）、`--reward-shaping-open-cannon`（空头炮：己炮与对方将同纵线，其间无子弱奖、恰一枚对方子作炮架时满系数）、`--reward-shaping-rook-pin-cannon`（车牵炮：己车与对方车、炮共线且该直/横线上**仅有**这三枚子，近似「车牵无根车炮线」）。
 
 **数据准备 / GPU 占用**：14 路根平面编码计算量很小，**默认 `--encode-backend inline`**（主进程批量 numpy + **一次** H2D），避免 rollout 每步两次大批编码时 **进程池 pickle/IPC** 反压 GPU（表现为 `nvidia-smi` 利用率低、编码 worker 进程 CPU 也低）。可选 `--encode-backend thread` 或 `process`，并配合 `--encode-workers`。**`--rollout-pipeline-groups`**（默认 2）：采样与价值前向在编码阶段把局面拆成两半，主线程与守护线程各编一半再拼批、一次 `trunk`（`eval()` 下与整批一致），叠合 CPU 准备空档；设为 **1** 关闭。rollout 每步仍有 **策略 + 价值** 两次 trunk（状态不同）。若 GPU 仍低，可增大 `--n-env` 或尝试 `torch.compile` 等。
 
