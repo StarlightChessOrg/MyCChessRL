@@ -117,8 +117,11 @@ def policy_value_loss_step(
     """
     PPO 更新。``mini_batch_size`` 为 None 或 ≥ N 时整批一次前向；
     否则按小批 **梯度累积**：``backward(loss * k/N)``，等价于全样本平均梯度，峰值显存随小批大小变化。
+
+    使用 ``model.eval()``：ResNet 中含 BatchNorm 时，必须与 rollout / ``old_logp`` 的 eval 前向一致，
+    否则 train 下 BN 用 batch 统计量会导致 ``logp`` 与 ``old_logp`` 不可比，ratio/approx_kl 失真。
     """
-    model.train()
+    model.eval()
     n = int(obs.shape[0])
     if n == 0:
         return 0.0, {"batch": 0.0}

@@ -141,14 +141,14 @@ def main() -> None:
 
     if args.checkpoint is not None:
         model, flist = load_successor_policy_for_play(args.checkpoint, device)
-        model.train()
+        model.eval()
         _LOG.info("从 checkpoint 加载: %s", args.checkpoint)
     else:
         model = SuccessorPolicy().to(device)
         from mycchess_rl.chess import FEATURE_LIST
 
         flist = {"red": list(FEATURE_LIST["red"]), "black": list(FEATURE_LIST["black"])}
-        model.train()
+        model.eval()
         _LOG.info("随机初始化策略网络")
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -311,6 +311,8 @@ def main() -> None:
             _LOG.warning("update=%d 无有效样本（全部被跳过），跳过优化", upd)
             continue
 
+        n_opt_samples = len(obs_list)
+
         t_opt0 = time.perf_counter()
         _LOG.info(
             "[ppo] update %d 优化阶段 | 有效样本=%d / slots=%d | 编码+batch trunk...",
@@ -397,7 +399,7 @@ def main() -> None:
                 optimize_s,
                 upd_s,
                 slots_total,
-                len(obs_list),
+                n_opt_samples,
                 n_skipped,
                 n_done_rollout,
                 mean_abs_rew / max(slots_total, 1),
