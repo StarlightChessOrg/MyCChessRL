@@ -165,10 +165,22 @@ def _resolve_sample_counts(
         except (OSError, TypeError, ValueError, KeyError):
             pass
     n_train = 0
-    for p in tqdm(train_files, desc="统计 train 样本", leave=True):
+    for p in tqdm(
+        train_files,
+        desc="[计数·非训练] train 棋谱文件",
+        unit="file",
+        leave=True,
+        mininterval=0.2,
+    ):
         n_train += count_joint_sl_samples_in_file(p, policy_max_legal=policy_max_legal)
     n_val = 0
-    for p in tqdm(val_files, desc="统计 val 样本", leave=True):
+    for p in tqdm(
+        val_files,
+        desc="[计数·非训练] val 棋谱文件",
+        unit="file",
+        leave=True,
+        mininterval=0.2,
+    ):
         n_val += count_joint_sl_samples_in_file(p, policy_max_legal=policy_max_legal)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(
@@ -211,6 +223,12 @@ def main() -> None:
         "--recount-samples",
         action="store_true",
         help="忽略 save-dir 下样本数缓存，强制重新统计 train/val 条数",
+    )
+    p.add_argument(
+        "--log-every",
+        type=int,
+        default=50,
+        help="训练时每隔多少个 batch 打一行 INFO（EMA loss/acc + 当前 batch）；0 表示不打。每个 batch 的 EMA 仍由 tqdm  postfix 刷新。",
     )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
@@ -350,8 +368,19 @@ def main() -> None:
             bs,
             drop_last=False,
         )
-        pbar_tr = tqdm(train_iter, total=n_train_batches, desc=f"epoch {epoch} train", leave=True, mininterval=0.5)
+        pbar_tr = tqdm(
+            train_iter,
+            total=n_train_batches,
+            desc=f"epoch {epoch} train",
+            unit="batch",
+            leave=True,
+            mininterval=0.0,
+            miniters=1,
+            dynamic_ncols=True,
+        )
+        train_bi = 0
         for x_np, m_np, yi_np, vs_np, hv_np in pbar_tr:
+            train_bi += 1
             x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(x_np, m_np, yi_np, vs_np, hv_np, device)
             opt.zero_grad(set_to_none=True)
             logits_m, v_pred = model(x)
@@ -373,12 +402,29 @@ def main() -> None:
             exp_acc.update(acc * 100.0)
             el_b = exp_loss.get()
             ea_b = exp_acc.get()
-            pbar_tr.set_postfix(
-                ema_loss=f"{el_b:.4f}" if el_b is not None else f"{float(loss.item()):.4f}",
-                ema_acc=f"{ea_b:.2f}%" if ea_b is not None else f"{acc * 100.0:.2f}%",
-                batch=f"{float(loss.item()):.3f}/{acc * 100.0:.1f}%",
-                step=global_step,
+            ema_l = float(el_b) if el_b is not None else float(loss.item())
+            ema_a = float(ea_b) if ea_b is not None else float(acc * 100.0)
+            raw_l = float(loss.item())
+            raw_a = float(acc * 100.0)
+            pbar_tr.set_postfix_str(
+                f"EMA_loss={ema_l:.4f} EMA_acc={ema_a:.2f}% | "
+                f"batch_loss={raw_l:.4f} batch_acc={raw_a:.2f}% | step={global_step}",
+                refresh=True,
             )
+            le = int(args.log_every)
+            if le > 0 and (train_bi == 1 or train_bi % le == 0):
+                _LOG.info(
+                    "epoch %d train batch %d/%d | EMA loss=%.4f EMA acc=%.2f%% | "
+                    "batch loss=%.4f batch acc=%.2f%% | step=%d",
+                    epoch,
+                    train_bi,
+                    n_train_batches,
+                    ema_l,
+                    ema_a,
+                    raw_l,
+                    raw_a,
+                    global_step,
+                )
 
         el = exp_loss.get()
         ea = exp_acc.get()
@@ -404,8 +450,19 @@ def main() -> None:
                     drop_last=False,
                 )
                 val_total = n_val_batches
-            pbar_va = tqdm(val_iter, total=val_total, desc=f"epoch {epoch} val", leave=True, mininterval=0.5)
+            pbar_va = tqdm(
+                val_iter,
+                total=val_total,
+                desc=f"epoch {epoch} val",
+                unit="batch",
+                leave=True,
+                mininterval=0.0,
+                miniters=1,
+                dynamic_ncols=True,
+            )
+            val_bi = 0
             for x_np, m_np, yi_np, vs_np, hv_np in pbar_va:
+                val_bi += 1
                 x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(
                     x_np, m_np, yi_np, vs_np, hv_np, device
                 )
@@ -427,11 +484,26 @@ def main() -> None:
                 val_ema_acc.update(a_b)
                 vl_e = val_ema_loss.get()
                 va_e = val_ema_acc.get()
-                pbar_va.set_postfix(
-                    ema_loss=f"{vl_e:.4f}" if vl_e is not None else f"{v_b:.4f}",
-                    ema_acc=f"{va_e:.2f}%" if va_e is not None else f"{a_b:.2f}%",
-                    batch=f"{v_b:.3f}/{a_b:.1f}%",
+                ema_vl = float(vl_e) if vl_e is not None else v_b
+                ema_va = float(va_e) if va_e is not None else a_b
+                pbar_va.set_postfix_str(
+                    f"EMA_loss={ema_vl:.4f} EMA_acc={ema_va:.2f}% | "
+                    f"batch_loss={v_b:.4f} batch_acc={a_b:.2f}%",
+                    refresh=True,
                 )
+                le = int(args.log_every)
+                if le > 0 and (val_bi == 1 or val_bi % le == 0):
+                    _LOG.info(
+                        "epoch %d val batch %d/%d | EMA loss=%.4f EMA acc=%.2f%% | "
+                        "batch loss=%.4f batch acc=%.2f%%",
+                        epoch,
+                        val_bi,
+                        val_total,
+                        ema_vl,
+                        ema_va,
+                        v_b,
+                        a_b,
+                    )
 
         if v_losses:
             val_m = float(np.mean(v_losses))
