@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from mycchess_rl.model import PolicyValueBackbone, policy_temperature_scalar
+from mycchess_rl.policy_inference import batched_encode_roots
 
 
 @dataclass
@@ -99,7 +100,12 @@ def _ppo_forward_loss_joint(
 def policy_value_loss_step(
     model: PolicyValueBackbone,
     opt: torch.optim.Optimizer,
-    obs: torch.Tensor,
+    obs_list: list,
+    flist: dict[str, list[str]],
+    device: torch.device,
+    *,
+    encode_workers: int = 1,
+    encode_backend: str = "inline",
     legal_mask: torch.Tensor,
     action_idx: torch.Tensor,
     old_logp: torch.Tensor,
@@ -107,18 +113,17 @@ def policy_value_loss_step(
     ret_value: torch.Tensor,
     old_v: torch.Tensor,
     cfg: PPOConfig,
-    *,
     mini_batch_size: int | None = None,
     policy_temperature: float = 1.0,
 ) -> tuple[float, dict[str, float]]:
     """
-    PPO 更新。``mini_batch_size`` 为 None 或 ≥ N 时整批一次前向；
-    否则按小批梯度累积。
+    PPO 更新：按 ``mini_batch_size`` 对 ``obs_list`` **分块根编码**再前向，梯度按样本比例加权累积，
+    末尾一次 ``opt.step()``；不在内存中保留整轮 ``xb``。
 
-    使用 ``model.eval()``：ResNet 中含 BatchNorm 时，必须与 rollout / ``old_logp`` 的 eval 前向一致。
+    使用 ``model.eval()``：含 BatchNorm 时须与 rollout / ``old_logp`` 的 eval 前向一致。
     """
     model.eval()
-    n = int(obs.shape[0])
+    n = len(obs_list)
     if n == 0:
         return 0.0, {"batch": 0.0}
     if str(getattr(model, "policy_kind", "joint")).lower() == "hierarchical":
@@ -128,46 +133,6 @@ def policy_value_loss_step(
         )
 
     mbs = n if mini_batch_size is None else max(1, int(mini_batch_size))
-    if mbs >= n:
-        loss, dbg = _ppo_forward_loss_joint(
-            model,
-            obs,
-            legal_mask,
-            action_idx,
-            old_logp,
-            adv,
-            ret_value,
-            old_v,
-            cfg,
-            policy_temperature=policy_temperature,
-        )
-        opt.zero_grad()
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-        opt.step()
-        rm, r2 = dbg["ratio_mean"], dbg["ratio_sq_mean"]
-        rstd = (max(0.0, r2 - rm * rm)) ** 0.5
-        metrics: dict[str, float] = {
-            "loss_total": float(loss.detach().cpu()),
-            "loss_policy": dbg["pol"],
-            "loss_value": dbg["v"],
-            "loss_vf_weighted": cfg.vf_coef * dbg["v"],
-            "entropy_sum": dbg["ent"],
-            "entropy_src": dbg["ent"],
-            "entropy_dst": 0.0,
-            "ratio_mean": rm,
-            "ratio_std": rstd,
-            "clip_frac": dbg["clip_frac"],
-            "approx_kl": dbg["approx_kl"],
-            "grad_norm": float(
-                grad_norm.detach().cpu() if isinstance(grad_norm, torch.Tensor) else grad_norm
-            ),
-            "batch": float(n),
-            "v_pred_mean": dbg["v_pred_mean"],
-            "old_v_mean": dbg["old_v_mean"],
-        }
-        return metrics["loss_total"], metrics
-
     opt.zero_grad()
     acc_pol = acc_v = acc_ent = 0.0
     acc_rm = acc_r2 = 0.0
@@ -178,9 +143,17 @@ def policy_value_loss_step(
     for start in range(0, n, mbs):
         end = min(start + mbs, n)
         w = (end - start) / n
+        obs_mb = obs_list[start:end]
+        xb = batched_encode_roots(
+            obs_mb,
+            flist,
+            device,
+            encode_workers=encode_workers,
+            encode_backend=encode_backend,
+        )
         loss_mb, dbg = _ppo_forward_loss_joint(
             model,
-            obs[start:end],
+            xb,
             legal_mask[start:end],
             action_idx[start:end],
             old_logp[start:end],
@@ -190,6 +163,7 @@ def policy_value_loss_step(
             cfg,
             policy_temperature=policy_temperature,
         )
+        del xb
         (loss_mb * w).backward()
         acc_loss_log += float(loss_mb.detach().cpu()) * w
         acc_pol += dbg["pol"] * w

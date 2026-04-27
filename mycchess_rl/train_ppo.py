@@ -23,6 +23,7 @@ from mycchess_rl.policy_inference import (
     batched_encode_roots,
     batched_joint_logprob_on_moves,
     batched_value_expectation,
+    joint_legal_mask_and_action_index,
 )
 from mycchess_rl.ppo import PPOConfig, compute_gae, policy_value_loss_step
 from mycchess_rl.vec_env import ParallelXiangqiVecEnv, collect_rollout_step, reset_finished
@@ -137,6 +138,13 @@ def main() -> None:
         help="PPO 反向时 GPU mini-batch 大小；整轮样本可达数万，过小则慢、过大易 OOM（A100 40GB 建议 2048~8192）",
     )
     p.add_argument(
+        "--old-logp-chunk",
+        type=int,
+        default=2048,
+        help="计算 old_logp 时每批前向的样本数：小于全量可避免与 trunk+head 同时占满显存；"
+        "远大于 1 保持吞吐。≤0 时与 --ppo-mini-batch 相同。",
+    )
+    p.add_argument(
         "--rollout-pipeline-groups",
         type=int,
         default=2,
@@ -242,12 +250,17 @@ def main() -> None:
         name = torch.cuda.get_device_name(idx)
         _LOG.info("CUDA 设备: [%d] %s", idx, name)
         torch.cuda.reset_peak_memory_stats(idx)
+    _ol_chunk = int(args.old_logp_chunk)
+    if _ol_chunk <= 0:
+        _ol_chunk = max(1, int(args.ppo_mini_batch))
     _LOG.info(
-        "特征编码 backend=%s encode_workers=%d（仅 thread/process）| rollout_pipeline_groups=%d | PPO mini-batch=%d",
+        "特征编码 backend=%s encode_workers=%d（仅 thread/process）| rollout_pipeline_groups=%d | "
+        "PPO mini-batch=%d | old_logp chunk=%d",
         enc_be,
         enc_w,
         rp_groups,
         int(args.ppo_mini_batch),
+        _ol_chunk,
     )
     _LOG.info(
         "checkpoint 目录=%s | save_every=%d（0=不写 weights/upd_*.pt；仍每轮更新 last.pt，更优时写 best.pt）",
@@ -452,38 +465,51 @@ def main() -> None:
 
             t_opt0 = time.perf_counter()
             _LOG.info(
-                "[ppo] update %d 优化阶段 | 有效样本=%d / slots=%d | 编码+batch trunk...",
+                "[ppo] update %d 优化阶段 | 有效样本=%d / slots=%d | 分块 old_logp + 按 mini-batch 编码反向",
                 upd,
                 len(obs_list),
                 slots_total,
             )
-            xb = batched_encode_roots(
-                obs_list,
-                flist,
-                device,
-                encode_workers=enc_w,
-                encode_backend=enc_be,
-            )
+            ol_chunk = int(args.old_logp_chunk)
+            if ol_chunk <= 0:
+                ol_chunk = max(1, int(args.ppo_mini_batch))
             with torch.no_grad():
                 model.eval()
-                pol_roll, val_roll = trunk_policy_value_feats(model, xb)
+                legal_mask_b, action_idx_b = joint_legal_mask_and_action_index(
+                    obs_list, mv_list, device, model.policy_max_legal
+                )
+                old_lp = torch.empty(n_opt_samples, device=device, dtype=torch.float32)
                 _LOG.info(
-                    "[ppo] update %d 计算 old_logp（整批 head，样本数=%d）...",
+                    "[ppo] update %d 计算 old_logp（分块 chunk=%d，样本数=%d）...",
                     upd,
-                    pol_roll.shape[0],
+                    ol_chunk,
+                    n_opt_samples,
                 )
-                old_lp, legal_mask_b, action_idx_b = batched_joint_logprob_on_moves(
-                    obs_list,
-                    mv_list,
-                    pol_roll,
-                    model,
-                    device,
-                    policy_temperature=1.0,
-                    value_feat=val_roll,
-                )
-                del pol_roll, val_roll
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+                for s in range(0, n_opt_samples, ol_chunk):
+                    e = min(s + ol_chunk, n_opt_samples)
+                    obs_c = obs_list[s:e]
+                    mv_c = mv_list[s:e]
+                    x_c = batched_encode_roots(
+                        obs_c,
+                        flist,
+                        device,
+                        encode_workers=enc_w,
+                        encode_backend=enc_be,
+                    )
+                    pol_c, val_c = trunk_policy_value_feats(model, x_c)
+                    lp_c, _, _ = batched_joint_logprob_on_moves(
+                        obs_c,
+                        mv_c,
+                        pol_c,
+                        model,
+                        device,
+                        policy_temperature=1.0,
+                        value_feat=val_c,
+                    )
+                    old_lp[s:e] = lp_c
+                    del x_c, pol_c, val_c, lp_c
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
             _LOG.info(
                 "[ppo] update %d old_logp 完成 elapsed=%.2fs，开始反向更新",
                 upd,
@@ -497,18 +523,22 @@ def main() -> None:
             loss, m = policy_value_loss_step(
                 model,
                 opt,
-                xb,
-                legal_mask_b,
-                action_idx_b,
-                old_lp,
-                adv_b,
-                ret_b,
-                old_v,
-                cfg,
+                obs_list,
+                flist,
+                device,
+                encode_workers=enc_w,
+                encode_backend=enc_be,
+                legal_mask=legal_mask_b,
+                action_idx=action_idx_b,
+                old_logp=old_lp,
+                adv=adv_b,
+                ret_value=ret_b,
+                old_v=old_v,
+                cfg=cfg,
                 mini_batch_size=int(args.ppo_mini_batch),
                 policy_temperature=1.0,
             )
-            del xb, old_lp, adv_b, ret_b, old_v, legal_mask_b, action_idx_b
+            del old_lp, adv_b, ret_b, old_v, legal_mask_b, action_idx_b
             obs_list.clear()
             mv_list.clear()
             adv_list.clear()
