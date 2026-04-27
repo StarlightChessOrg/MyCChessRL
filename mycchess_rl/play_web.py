@@ -42,6 +42,16 @@ def _piece_side(ch: str | None) -> str | None:
     return "red" if ch.isupper() else "black"
 
 
+def _board_view_y_to_iccs_y(iy_view: int) -> int:
+    """``board_view`` 行索引（与 ``np.flip(FEN)`` 后网格一致）→ 引擎 ICCS 纵坐标 0..9。"""
+    return 9 - iy_view
+
+
+def _iccs_y_to_board_view_y(iy_iccs: int) -> int:
+    """引擎 ICCS y → ``board_view`` 行索引（网页格子 data-iy 使用）。"""
+    return 9 - iy_iccs
+
+
 def _select_device(gpu: int) -> torch.device:
     if gpu < 0:
         return torch.device("cpu")
@@ -57,7 +67,8 @@ class XqwlWebSession:
         self.device = device
         self.flist = flist
         self.game = GamePlay()
-        self.sel_from: tuple[int, int] | None = None
+        self.sel_from: tuple[int, int] | None = None  # board_view 坐标 (ix, iy)
+        # 上一着 ICCS 引擎坐标 (x1,y1,x2,y2)，与 ``legal_moves_iccs`` 一致
         self.last_move: tuple[int, int, int, int] | None = None
         self.strategy_red = STRATEGY_NEURAL
         self.strategy_black = STRATEGY_HUMAN
@@ -103,12 +114,21 @@ class XqwlWebSession:
                         row.append({"ch": s, "side": _piece_side(s), "label": _PIECE_CHAR.get(s, "?")})
                 rows.append(row)
             side = self.game.get_side()
+            lm_view: list[int] | None = None
+            if self.last_move:
+                x1, y1, x2, y2 = self.last_move
+                lm_view = [
+                    x1,
+                    _iccs_y_to_board_view_y(y1),
+                    x2,
+                    _iccs_y_to_board_view_y(y2),
+                ]
             return {
                 "board": rows,
                 "visual_sig": "|".join(str(arr[iy, ix] or ".") for iy in range(10) for ix in range(9)),
                 "side_to_move": side,
                 "sel_from": list(self.sel_from) if self.sel_from else None,
-                "last_move": list(self.last_move) if self.last_move else None,
+                "last_move": lm_view,
                 "strategy_red": self.strategy_red,
                 "strategy_black": self.strategy_black,
                 "strategies": list(STRATEGIES),
@@ -156,7 +176,8 @@ class XqwlWebSession:
                     self.sel_from = (ix, iy)
                 return None
             fx, fy = self.sel_from
-            mv = f"{fx}{fy}-{ix}{iy}"
+            y1e, y2e = _board_view_y_to_iccs_y(fy), _board_view_y_to_iccs_y(iy)
+            mv = f"{fx}{y1e}-{ix}{y2e}"
             if mv not in self._legal_strings():
                 if _piece_side(str(ch) if ch else None) == side:
                     self.sel_from = (ix, iy)
@@ -245,6 +266,7 @@ def _html_page() -> str:
       background:rgba(0,0,0,.25);color:var(--text);font-size:14px}
     button{margin-top:16px;padding:12px 16px;border:none;border-radius:10px;
       background:linear-gradient(180deg,#8d6e63 0%,#6d4c41 100%);color:#fff;font-size:15px;font-weight:600;cursor:pointer;width:100%}
+    button.btn-secondary{margin-top:10px;background:linear-gradient(180deg,#5d6b7a 0%,#455a64 100%)}
     #status{margin-top:16px;white-space:pre-wrap;font-size:13px;padding:12px 14px;background:rgba(0,0,0,.22);border-radius:10px;min-height:4.5em}
     .ai-busy .board{opacity:.92;pointer-events:none}
   </style>
@@ -258,6 +280,7 @@ def _html_page() -> str:
       <label>红方策略</label><select id="sel-red"></select>
       <label>黑方策略</label><select id="sel-black"></select>
       <button type="button" id="btn-new">新局</button>
+      <button type="button" class="btn-secondary" id="btn-flip" title="上下翻转棋盘（黑方视角）">翻转棋盘</button>
       <div id="status"></div>
     </div>
   </div>
@@ -265,16 +288,20 @@ def _html_page() -> str:
 (function(){
   const shell=document.getElementById("shell"),boardEl=document.getElementById("board"),statusEl=document.getElementById("status");
   const selRed=document.getElementById("sel-red"),selBlack=document.getElementById("sel-black"),btnNew=document.getElementById("btn-new");
-  let lastVisualSig=null,pollTimer=null;
+  const btnFlip=document.getElementById("btn-flip");
+  let viewFlipY=false,pollTimer=null,lastSnap=null;
   function showAlert(t,b){alert(t+"\\n\\n"+b);}
   function fillStrategiesOnce(strategies){
     if(selRed.options.length>0)return;
     strategies.forEach(function(t){var o=document.createElement("option");o.value=o.textContent=t;selRed.appendChild(o);});
     strategies.forEach(function(t){var o=document.createElement("option");o.value=o.textContent=t;selBlack.appendChild(o);});
   }
+  /** 视觉行 iyVis -> 服务端棋盘行 iy（红在下坐标系） */
+  function srvY(iyVis){return viewFlipY?(9-iyVis):iyVis;}
   function renderCells(snap){
     var lm=snap.last_move,sf=snap.sel_from,frag=document.createDocumentFragment();
-    for(var iy=0;iy<10;iy++)for(var ix=0;ix<9;ix++){
+    for(var iyVis=0;iyVis<10;iyVis++)for(var ix=0;ix<9;ix++){
+      var iy=srvY(iyVis);
       var cell=document.createElement("div");cell.className="cell";cell.dataset.ix=String(ix);cell.dataset.iy=String(iy);
       if(lm&&ix===lm[0]&&iy===lm[1])cell.classList.add("last-from");
       if(lm&&ix===lm[2]&&iy===lm[3])cell.classList.add("last-to");
@@ -289,8 +316,8 @@ def _html_page() -> str:
   function applySnap(snap){
     fillStrategiesOnce(snap.strategies||[]);selRed.value=snap.strategy_red;selBlack.value=snap.strategy_black;
     statusEl.textContent=snap.status_text||"";
-    var sig=snap.visual_sig!=null?snap.visual_sig:JSON.stringify(snap.board);
-    if(sig!==lastVisualSig){lastVisualSig=sig;renderCells(snap);}
+    /* 每次刷新都重绘：避免仅依赖 visual_sig 时 ai_busy / 选子 / 行棋方 变化但 DOM 未更新，导致误判「无法走黑」或遮罩不消 */
+    renderCells(snap);
     shell.classList.toggle("ai-busy",!!snap.ai_busy);
   }
   function handleMessages(msg){
@@ -302,7 +329,7 @@ def _html_page() -> str:
     pollTimer=null;
     Promise.all([fetch("/api/state",{cache:"no-store"}).then(function(r){return r.json();}),
       fetch("/api/messages",{cache:"no-store"}).then(function(r){return r.json();})])
-      .then(function(pair){applySnap(pair[0]);handleMessages(pair[1]);armPoll(pair[0].ai_busy?160:380);})
+      .then(function(pair){lastSnap=pair[0];applySnap(pair[0]);handleMessages(pair[1]);armPoll(pair[0].ai_busy?160:380);})
       .catch(function(){armPoll(700);});
   }
   boardEl.addEventListener("click",function(ev){
@@ -327,6 +354,11 @@ def _html_page() -> str:
     fetch("/api/new_game",{method:"POST"}).then(function(r){return r.json();})
       .then(function(j){if(j.error)showAlert("新局",j.error);else armPoll(25);});
   });
+  btnFlip.addEventListener("click",function(){
+    viewFlipY=!viewFlipY;
+    btnFlip.textContent=viewFlipY?"还原朝向":"翻转棋盘";
+    if(lastSnap)renderCells(lastSnap);
+  });
   onePoll();
 })();
 </script>
@@ -346,7 +378,12 @@ def main() -> None:
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--workers", type=int, default=1, help="Sanic worker 数（>1 时勿依赖本进程内单会话）")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="保留参数；本对弈服务为单进程内存会话，实际以 single_process 运行（勿用多 worker）",
+    )
     args = p.parse_args()
 
     device = _select_device(int(args.gpu))
@@ -402,11 +439,16 @@ def main() -> None:
         await asyncio.sleep(0.2)
         session.maybe_ai()
 
-    print(f"[play] http://{args.host}:{args.port}/  (Sanic workers={args.workers})", flush=True)
+    # Sanic 在子进程里通过模块名加载 App；本脚本在 main() 内创建 App 且常以
+    # ``python mycchess_rl/play_web.py`` 启动（模块名为 __main__），多进程模式会
+    # 找不到已注册的 app。对弈状态仅存于本进程，故固定单进程启动。
+    if int(args.workers) != 1:
+        print("[play] 警告: --workers>1 对本网页对弈无效，已使用单进程。", flush=True)
+    print(f"[play] http://{args.host}:{args.port}/  (Sanic single_process)", flush=True)
     app.run(
         host=str(args.host),
         port=int(args.port),
-        workers=int(args.workers),
+        single_process=True,
         access_log=False,
         motd=False,
     )
