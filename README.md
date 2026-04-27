@@ -63,12 +63,12 @@ mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 python -m mycchess_rl.train_sl --cbf-root /path/to/cbf --save-dir runs
 python -m mycchess_rl.train_sl --cbf-root /path/to/cbf --checkpoint runs/best.pt --save-dir runs
 python -m mycchess_rl.train_sl --cbf-root /path/to/cbf --checkpoint runs/last.pt --epochs 5 --save-dir runs
-python -m mycchess_rl.train_sl --cbf-manifest my_cbfs.txt --epochs 2 --n-batch-train 100
+python -m mycchess_rl.train_sl --cbf-manifest my_cbfs.txt --epochs 2 --recount-samples
 ```
 
 **`--epochs`**：本轮再跑多少个 epoch（续 SL 时在已完成的 epoch 之后追加）。
 
-监督学习在 **主进程** 内用与 MyElephant 相同的 **``xmltodict`` + 无限打乱棋谱流** 组 batch（**不使用 DataLoader**），避免多进程/预取与本地扩展交互引发的崩溃。显存允许时可增大 ``--batch-size``。产出 ``save-dir`` 下的 ``best.pt`` / ``last.pt``（验证 loss 更优时更新 ``best.pt``），字段与 ``play_web`` / PPO 的 ``model`` 块兼容。
+监督学习在 **主进程** 内用 **``xmltodict``** 读棋谱、**不使用 DataLoader**；每 epoch **先扫完整个训练集**（打乱文件顺序、每文件一轮）→ **再扫完整个验证集** → 验证 loss 更优则写 ``best.pt``，且每轮都写 ``last.pt``（YOLO 习惯）。进度用 ``tqdm``；首次会统计 train/val 样本条数（可缓存在 ``save-dir/sl_sample_counts.json``，``--recount-samples`` 强制重算）。显存允许时可增大 ``--batch-size``。字段与 ``play_web`` / PPO 的 ``model`` 块兼容。
 
 ``train_ppo`` 会按轮打印 **rollout / 优化耗时、样本数、GAE 统计、分项损失、熵、importance ratio、clip 比例、近似 KL、梯度范数、CUDA 显存** 等；`--log-every N` 为每 N 轮打一次，`--log-file` 同步写入文件。`--rollout-log-every`（默认 32）在单轮 rollout 内输出进度，避免首轮长时间无输出。
 

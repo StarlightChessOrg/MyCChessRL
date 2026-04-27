@@ -1,6 +1,6 @@
 """XML ``.cbf`` 监督学习：联合合法槽 softmax + 价值 MSE。
 
-指定棋谱目录后训练；默认 **每 epoch 遍历 train/val 全部样本**（打乱文件顺序、每文件一轮）后再写 ``best.pt`` / ``last.pt``；训练/验证进度用 ``tqdm``。``--quick-epoch`` 可改回固定批次数。``--checkpoint`` 可选：省略则在 ``--save-dir`` 下自动生成 ``bootstrap.pt``；SL 存盘可续优化器与 ``epoch``/``global_step``。
+每 epoch：**整轮训练集**（打乱棋谱文件顺序、每文件一轮）→ **整轮验证集** → 若验证 loss 更优则更新 ``best.pt``，并**总是**写入 ``last.pt``（对齐 YOLO 习惯）。进度条用 ``tqdm``。``--checkpoint`` 可选；SL 存盘可续优化器与 ``epoch``/``global_step``。
 """
 from __future__ import annotations
 
@@ -37,10 +37,8 @@ from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play, t
 from mycchess_rl.sl_data import (
     count_joint_sl_samples_in_file,
     discover_cbf_files,
-    infinite_shuffled_joint_samples,
     iter_collated_batches_from_finite_samples,
     iter_epoch_joint_samples_shuffled,
-    next_collated_batch,
     split_paths_train_test,
 )
 
@@ -210,23 +208,6 @@ def main() -> None:
         help="本轮要跑的 epoch 数（续训时在已完成的 epoch 之后再跑这么多个）",
     )
     p.add_argument(
-        "--quick-epoch",
-        action="store_true",
-        help="快速模式：每 epoch 只跑固定批次数（--n-batch-train / --n-batch-val），不遍历全数据集",
-    )
-    p.add_argument(
-        "--n-batch-train",
-        type=int,
-        default=200,
-        help="仅与 --quick-epoch 同时使用：每 epoch 训练批次数",
-    )
-    p.add_argument(
-        "--n-batch-val",
-        type=int,
-        default=30,
-        help="仅与 --quick-epoch 同时使用：每 epoch 验证批次数",
-    )
-    p.add_argument(
         "--recount-samples",
         action="store_true",
         help="忽略 save-dir 下样本数缓存，强制重新统计 train/val 条数",
@@ -280,20 +261,12 @@ def main() -> None:
         _LOG.error("请指定 --cbf-root 或 --cbf-manifest")
         raise SystemExit(2)
 
-    if args.quick_epoch:
-        _LOG.info(
-            "监督学习（快速 epoch）：每轮 train=%d 批、val=%d 批 × batch_size=%d；主进程流式组 batch，无 DataLoader。",
-            int(args.n_batch_train),
-            int(args.n_batch_val),
-            int(args.batch_size),
-        )
-    else:
-        _LOG.info(
-            "监督学习（完整 epoch）：每轮 **先扫完 train 全样本、再扫完 val 全样本** 后写入 best.pt / last.pt；"
-            "batch_size=%d；样本条数缓存在 %s（可用 --recount-samples 强制重算）。",
-            int(args.batch_size),
-            _SL_COUNT_CACHE,
-        )
+    _LOG.info(
+        "监督学习（YOLO 式 epoch）：每轮 train 全量 → val 全量 → 更优则 best.pt，且每轮 last.pt；"
+        "batch_size=%d；样本条数缓存在 %s（--recount-samples 强制重算）。",
+        int(args.batch_size),
+        _SL_COUNT_CACHE,
+    )
 
     device = torch.device("cpu")
     if args.gpu >= 0 and torch.cuda.is_available():
@@ -344,35 +317,24 @@ def main() -> None:
         g["lr"] = float(args.lr)
     pm = model.policy_max_legal
     bs = int(args.batch_size)
-    train_rng = random.Random(int(args.data_seed))
-    val_rng = random.Random(int(args.data_seed) + 1_000_003)
-    train_gen = None
-    val_gen = None
-    if args.quick_epoch:
-        train_gen = infinite_shuffled_joint_samples(train_files, policy_max_legal=pm, rng=train_rng)
-        val_gen = infinite_shuffled_joint_samples(val_files, policy_max_legal=pm, rng=val_rng)
-
-    n_train_samples = n_val_samples = 0
-    n_train_batches = n_val_batches = 0
-    if not args.quick_epoch:
-        n_train_samples, n_val_samples = _resolve_sample_counts(
-            save_dir,
-            train_files,
-            val_files,
-            pm,
-            force_recount=bool(args.recount_samples),
-        )
-        if n_train_samples <= 0:
-            raise RuntimeError("train 集样本数为 0：请检查 .cbf 与标准开局 FEN")
-        n_train_batches = (n_train_samples + bs - 1) // bs
-        n_val_batches = (n_val_samples + bs - 1) // bs if n_val_samples > 0 else 0
-        _LOG.info(
-            "样本计数: train=%d 条 → %d 批 | val=%d 条 → %d 批",
-            n_train_samples,
-            n_train_batches,
-            n_val_samples,
-            n_val_batches,
-        )
+    n_train_samples, n_val_samples = _resolve_sample_counts(
+        save_dir,
+        train_files,
+        val_files,
+        pm,
+        force_recount=bool(args.recount_samples),
+    )
+    if n_train_samples <= 0:
+        raise RuntimeError("train 集样本数为 0：请检查 .cbf 与标准开局 FEN")
+    n_train_batches = (n_train_samples + bs - 1) // bs
+    n_val_batches = (n_val_samples + bs - 1) // bs if n_val_samples > 0 else 0
+    _LOG.info(
+        "样本计数: train=%d 条 → %d 批 | val=%d 条 → %d 批",
+        n_train_samples,
+        n_train_batches,
+        n_val_samples,
+        n_val_batches,
+    )
 
     t0 = time.perf_counter()
 
@@ -382,23 +344,13 @@ def main() -> None:
         exp_acc = _ExpVal()
         model.train()
 
-        if args.quick_epoch:
-            train_iter = (
-                next_collated_batch(train_gen, bs) for _ in range(int(args.n_batch_train))
-            )
-            train_total = int(args.n_batch_train)
-        else:
-            ep_tr_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 7)
-            train_iter = iter_collated_batches_from_finite_samples(
-                iter_epoch_joint_samples_shuffled(
-                    train_files, policy_max_legal=pm, rng=ep_tr_rng
-                ),
-                bs,
-                drop_last=False,
-            )
-            train_total = n_train_batches
-
-        pbar_tr = tqdm(train_iter, total=train_total, desc=f"epoch {epoch} train", leave=True, mininterval=0.5)
+        ep_tr_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 7)
+        train_iter = iter_collated_batches_from_finite_samples(
+            iter_epoch_joint_samples_shuffled(train_files, policy_max_legal=pm, rng=ep_tr_rng),
+            bs,
+            drop_last=False,
+        )
+        pbar_tr = tqdm(train_iter, total=n_train_batches, desc=f"epoch {epoch} train", leave=True, mininterval=0.5)
         for x_np, m_np, yi_np, vs_np, hv_np in pbar_tr:
             x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(x_np, m_np, yi_np, vs_np, hv_np, device)
             opt.zero_grad(set_to_none=True)
@@ -430,10 +382,7 @@ def main() -> None:
         v_losses: list[float] = []
         v_accs: list[float] = []
         with torch.no_grad():
-            if args.quick_epoch:
-                val_iter = (next_collated_batch(val_gen, bs) for _ in range(int(args.n_batch_val)))
-                val_total = int(args.n_batch_val)
-            elif n_val_batches <= 0:
+            if n_val_batches <= 0:
                 val_iter = iter(())
                 val_total = 0
             else:
