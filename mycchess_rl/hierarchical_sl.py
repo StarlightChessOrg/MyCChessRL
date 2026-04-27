@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from mycchess_rl.iccs_util import parse_move_squares
+from mycchess_rl.iccs_util import iccs_y_to_board_view_row, parse_move_squares
 from mycchess_rl.piece_types import ChessSide, PieceT, fench_to_species
 
 HIER_PIECE_HEAD_DIM = 7
@@ -26,8 +26,9 @@ def piece_t_to_head_index(pt: PieceT) -> int:
     return int(_PIECE_ORDER.index(pt))
 
 
-def square_iccs_to_index(y: int, x: int) -> int:
-    return int(y) * 9 + int(x)
+def square_iccs_to_index(y_iccs: int, x: int) -> int:
+    """ICCS 引擎 (y,x) → ``board_view`` 行主序展平下标 0..89。"""
+    return iccs_y_to_board_view_row(y_iccs) * 9 + int(x)
 
 
 def build_hierarchical_sl_labels(
@@ -50,7 +51,7 @@ def build_hierarchical_sl_labels(
         return None
     board = st.board_view()
     stm = ChessSide.RED if st.red_to_move else ChessSide.BLACK
-    ch0 = str(board[y1, x1])
+    ch0 = str(board[iccs_y_to_board_view_row(y1), x1])
     if not ch0:
         return None
     try:
@@ -69,7 +70,7 @@ def build_hierarchical_sl_labels(
 
     for mv in legs:
         ax1, ay1, ax2, ay2 = parse_move_squares(mv)
-        ach = str(board[ay1, ax1])
+        ach = str(board[iccs_y_to_board_view_row(ay1), ax1])
         if not ach:
             continue
         try:
