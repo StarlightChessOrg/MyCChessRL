@@ -18,7 +18,6 @@ from mycchess_rl.policy_inference import (
     batched_value_expectation,
 )
 from mycchess_rl.ppo import PPOConfig, compute_gae, policy_value_loss_step
-from mycchess_rl.reward_patterns import DEFAULT_TACTIC_SHAPING_COEFF
 from mycchess_rl.vec_env import ParallelXiangqiVecEnv, collect_rollout_step, reset_finished
 
 _LOG = logging.getLogger("mycchess_rl.train_ppo")
@@ -140,106 +139,16 @@ def main() -> None:
         help="每隔多少轮 update 保存一次 ``ppo_upd_*.pt``（0=仅训练结束时写 last）",
     )
     p.add_argument(
-        "--reward-shaping-step",
+        "--reward-shaping-king",
         type=float,
-        default=-0.0005,
-        help="非终局每步加常数（常用小负数以抑制瞎逛）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-check",
-        type=float,
-        default=0.02,
-        help="对手应将时奖励基量，并按落点与对方将/帅接近度放大（0.4~1.0 倍）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-king-prox",
-        type=float,
-        default=0.008,
-        help="非终局每步按落点与对方将/帅曼哈顿接近度给微弱奖（×[0,1]）；0=关闭",
+        default=0.015,
+        help="非终局：鼓励落点靠近对方将/帅（prox∈[0,1]）；若对方被应将再加 (0.4+0.6·prox)×同一系数。0=关闭",
     )
     p.add_argument(
         "--reward-shaping-capture",
         type=float,
         default=0.025,
         help="吃子奖励基量（兵卒=1×），车马炮等按子种加权；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-ae-shape",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"士象阵型微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-double-cannon",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"担子炮微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-rook-pair",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"双车同线微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-cross-pawn",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"过河卒微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-knight-flex",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"马灵活性微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-three-edge",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"三子归边近似（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-central-cannon",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"中炮近似，镇马宫心时加倍（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-open-cannon",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"空头炮近似（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-rook-pin-cannon",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"车牵炮近似（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-opp-king-gate",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"对方将门被堵微弱奖（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-miss-adv-double-rook",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"缺士对双车惩罚强度（默认 {DEFAULT_TACTIC_SHAPING_COEFF}，触发时减去该值）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-double-adv-king-center",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"双士护宫心（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
-    )
-    p.add_argument(
-        "--reward-shaping-king-near-start",
-        type=float,
-        default=DEFAULT_TACTIC_SHAPING_COEFF,
-        help=f"将帅近开局位（默认 {DEFAULT_TACTIC_SHAPING_COEFF}）；0=关闭",
     )
     args = p.parse_args()
 
@@ -298,44 +207,9 @@ def main() -> None:
         save_dir.resolve(),
         save_every,
     )
-    rs_stp = float(args.reward_shaping_step)
-    rs_chk = float(args.reward_shaping_check)
-    rs_kpx = float(args.reward_shaping_king_prox)
+    rs_king = float(args.reward_shaping_king)
     rs_cap = float(args.reward_shaping_capture)
-    rs_ae = float(args.reward_shaping_ae_shape)
-    rs_dcan = float(args.reward_shaping_double_cannon)
-    rs_rpair = float(args.reward_shaping_rook_pair)
-    rs_xpawn = float(args.reward_shaping_cross_pawn)
-    rs_kflex = float(args.reward_shaping_knight_flex)
-    rs_3edge = float(args.reward_shaping_three_edge)
-    rs_ccan = float(args.reward_shaping_central_cannon)
-    rs_ocan = float(args.reward_shaping_open_cannon)
-    rs_rpc = float(args.reward_shaping_rook_pin_cannon)
-    rs_okg = float(args.reward_shaping_opp_king_gate)
-    rs_madr = float(args.reward_shaping_miss_adv_double_rook)
-    rs_dakc = float(args.reward_shaping_double_adv_king_center)
-    rs_kns = float(args.reward_shaping_king_near_start)
-    _LOG.info(
-        "奖励塑形 step=%g check=%g king_prox=%g capture=%g | 战术 ae=%g dcan=%g rpair=%g xpawn=%g kflex=%g "
-        "3edge=%g ccan=%g ocan=%g rpc=%g okg=%g madr=%g dakc=%g kns=%g（全 0=纯终局）",
-        rs_stp,
-        rs_chk,
-        rs_kpx,
-        rs_cap,
-        rs_ae,
-        rs_dcan,
-        rs_rpair,
-        rs_xpawn,
-        rs_kflex,
-        rs_3edge,
-        rs_ccan,
-        rs_ocan,
-        rs_rpc,
-        rs_okg,
-        rs_madr,
-        rs_dakc,
-        rs_kns,
-    )
+    _LOG.info("奖励塑形 king=%g capture=%g（全 0=仅终局将死/和棋）", rs_king, rs_cap)
 
     cfg = PPOConfig(lr=args.lr)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
@@ -395,23 +269,8 @@ def main() -> None:
                 encode_workers=enc_w,
                 encode_backend=enc_be,
                 rollout_pipeline_groups=rp_groups,
-                reward_shaping_check=rs_chk,
                 reward_shaping_capture=rs_cap,
-                reward_shaping_king_prox=rs_kpx,
-                reward_shaping_step=rs_stp,
-                reward_shaping_ae_shape=rs_ae,
-                reward_shaping_double_cannon=rs_dcan,
-                reward_shaping_rook_pair=rs_rpair,
-                reward_shaping_cross_pawn=rs_xpawn,
-                reward_shaping_knight_flex=rs_kflex,
-                reward_shaping_three_edge=rs_3edge,
-                reward_shaping_central_cannon=rs_ccan,
-                reward_shaping_open_cannon=rs_ocan,
-                reward_shaping_rook_pin_cannon=rs_rpc,
-                reward_shaping_opp_king_gate=rs_okg,
-                reward_shaping_miss_adv_double_rook=rs_madr,
-                reward_shaping_double_adv_king_center=rs_dakc,
-                reward_shaping_king_near_start=rs_kns,
+                reward_shaping_king=rs_king,
             )
             act_buf[t, :] = moves
             rew_buf[t] = rew

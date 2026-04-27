@@ -7,7 +7,6 @@ import numpy as np
 
 from mycchess_rl.encode_parallel import default_encode_workers
 from mycchess_rl.policy_inference import batched_sample_moves_masked, eval_value_stm
-from mycchess_rl.reward_patterns import DEFAULT_TACTIC_SHAPING_COEFF, tactics_shaping_total
 from mycchess_rl.xqwl_state import XqwlGameState
 
 # 吃子塑形：以兵/卒为 1.0 的相对权重（与 ``reward_shaping_capture`` 基量相乘）
@@ -70,6 +69,17 @@ def _king_manhattan_proximity(
     return max(0.0, 1.0 - float(dist) / float(max(1, d_max)))
 
 
+def _king_attack_shaping(g: XqwlGameState, x_land: int, y_land: int, coeff: float) -> float:
+    """鼓励落点靠近对方将/帅；若走后对方处于应将，再叠加与接近度相关的奖励。"""
+    if coeff == 0.0:
+        return 0.0
+    prox = _king_manhattan_proximity(g, x_land, y_land)
+    out = float(coeff) * prox
+    if g.in_check():
+        out += float(coeff) * (0.4 + 0.6 * prox)
+    return float(out)
+
+
 @dataclass
 class SlotState:
     game: XqwlGameState = field(default_factory=XqwlGameState)
@@ -96,32 +106,13 @@ def collect_rollout_step(
     encode_workers: int | None = None,
     encode_backend: str = "inline",
     rollout_pipeline_groups: int = 1,
-    reward_shaping_check: float = 0.0,
     reward_shaping_capture: float = 0.0,
-    reward_shaping_king_prox: float = 0.0,
-    reward_shaping_step: float = 0.0,
-    reward_shaping_ae_shape: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_double_cannon: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_rook_pair: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_cross_pawn: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_knight_flex: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_three_edge: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_central_cannon: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_open_cannon: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_rook_pin_cannon: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_opp_king_gate: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_miss_adv_double_rook: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_double_adv_king_center: float = DEFAULT_TACTIC_SHAPING_COEFF,
-    reward_shaping_king_near_start: float = DEFAULT_TACTIC_SHAPING_COEFF,
+    reward_shaping_king: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, list[XqwlGameState], list[str]]:
-    """``reward_shaping_*``：稀疏终局奖励下的轻量塑形（**0 关闭**）。
+    """非终局塑形仅两项（**0 关闭**）：压对方将/帅、吃子（按子种加权）。
 
-    - ``reward_shaping_step``：非终局每步常数（常用小负数）。
-    - ``reward_shaping_capture``：吃子基量 × 按子种相对权重（兵=1，车马炮等更高）。
-    - ``reward_shaping_check``：对手应将时基量 × ``(0.4 + 0.6×prox)``，``prox`` 为落点与对方将/帅接近度。
-    - ``reward_shaping_king_prox``：每步（非终局）额外 ``×prox``，微弱鼓励压将。
-    - 战术类 ``reward_shaping_*`` 默认 ``reward_patterns.DEFAULT_TACTIC_SHAPING_COEFF``；``0`` 关闭该项。
-    - 详见 ``reward_patterns.tactics_shaping_total``（士象、担子炮、过河卒、将门等）。
+    - ``reward_shaping_king``：落点与对方将/帅的接近度 ``prox∈[0,1]`` 线性奖励；若走后对方应将，再加 ``×(0.4+0.6·prox)``。
+    - ``reward_shaping_capture``：吃子时 ``基量 × 子种权重``（兵卒=1，象士、马、炮、车、将递增，见 ``_CAPTURE_MULT``）。
     """
     n = vec.n_env
     rewards = np.zeros(n, dtype=np.float32)
@@ -170,38 +161,9 @@ def collect_rollout_step(
                 rewards[i] = 0.0
         else:
             dones[i] = False
-            prox = _king_manhattan_proximity(g, x2, y2)
-            r_shape = float(reward_shaping_step)
-            if reward_shaping_king_prox != 0.0:
-                r_shape += float(reward_shaping_king_prox) * prox
-            if reward_shaping_check != 0.0 and g.in_check():
-                check_scale = 0.4 + 0.6 * prox
-                r_shape += float(reward_shaping_check) * float(check_scale)
+            r_shape = _king_attack_shaping(g, x2, y2, float(reward_shaping_king))
             if reward_shaping_capture != 0.0 and cap_piece is not None:
                 r_shape += float(reward_shaping_capture) * _capture_multiplier(cap_piece)
-            bv = g.board_view()
-            piece_dst = str(bv[y2, x2]).strip()
-            last_mover_red = not g.red_to_move
-            r_shape += tactics_shaping_total(
-                bv,
-                piece_dst,
-                x2,
-                y2,
-                last_mover_red=last_mover_red,
-                coeff_ae=float(reward_shaping_ae_shape),
-                coeff_double_cannon=float(reward_shaping_double_cannon),
-                coeff_rook_pair=float(reward_shaping_rook_pair),
-                coeff_cross_pawn=float(reward_shaping_cross_pawn),
-                coeff_knight_flex=float(reward_shaping_knight_flex),
-                coeff_three_edge=float(reward_shaping_three_edge),
-                coeff_central_cannon=float(reward_shaping_central_cannon),
-                coeff_open_cannon=float(reward_shaping_open_cannon),
-                coeff_rook_pin_cannon=float(reward_shaping_rook_pin_cannon),
-                coeff_opp_king_gate=float(reward_shaping_opp_king_gate),
-                coeff_miss_adv_double_rook=float(reward_shaping_miss_adv_double_rook),
-                coeff_double_adv_king_center=float(reward_shaping_double_adv_king_center),
-                coeff_king_near_start=float(reward_shaping_king_near_start),
-            )
             rewards[i] = r_shape
 
     return rewards, dones, [s.game for s in vec.slots], moves_out
