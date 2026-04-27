@@ -7,6 +7,10 @@ from mycchess_rl.fen_parse import parse_fen_board
 from mycchess_rl.iccs_util import parse_move_squares
 
 
+# ``RepValue`` 和棋分支量级约 ``±20``；与判负相关的 ``±BAN_VALUE`` 远大于此，用于区分和棋式重复与判负
+REP_RULE_VALUE_DRAWISH_ABS = 50
+
+
 def _require_xqwl():
     try:
         from xqwl_core import Position as _P  # noqa: F401
@@ -88,6 +92,14 @@ class XqwlGameState:
 
     def in_check(self) -> bool:
         return bool(self.pos.in_check())
+
+    def rep_status(self, n_recur: int = 3) -> int:
+        """与 ``xqwl_core.Position.rep_status`` 一致；重复终局判定用。"""
+        return int(self.pos.rep_status(int(n_recur)))
+
+    def rep_value_if_any(self) -> int:
+        """重复判例时引擎分值（``RepValue(RepStatus)``）；非重复终局常为 0。正值对当前行棋方有利。"""
+        return int(self.pos.rep_value_if_any())
 
     def copy(self) -> XqwlGameState:
         o = object.__new__(XqwlGameState)

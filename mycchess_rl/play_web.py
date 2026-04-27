@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from mycchess_rl.iccs_util import parse_move_squares
+from mycchess_rl.xqwl_state import REP_RULE_VALUE_DRAWISH_ABS
 from mycchess_rl.chess.session import GamePlay
 from mycchess_rl.model import load_policy_value_for_play
 from mycchess_rl.policy_inference import infer_greedy_move_string
@@ -102,6 +103,20 @@ class XqwlWebSession:
         if r == "checkmate":
             stm = "红方" if self.game.red_to_move else "黑方"
             self._toasts.append({"kind": "info", "title": "终局", "body": f"{stm} 被将死。"})
+        elif r == "repetition_rule":
+            v = int(self.game.rep_value_if_any())
+            if abs(v) <= REP_RULE_VALUE_DRAWISH_ABS:
+                self._toasts.append({"kind": "info", "title": "终局", "body": "重复局面（和棋）。"})
+            elif v > 0:
+                w = "红方" if self.game.red_to_move else "黑方"
+                self._toasts.append(
+                    {"kind": "info", "title": "终局", "body": f"重复判例：{w} 胜（对方犯规判负）。"}
+                )
+            else:
+                w = "黑方" if self.game.red_to_move else "红方"
+                self._toasts.append(
+                    {"kind": "info", "title": "终局", "body": f"重复判例：{w} 胜（对方犯规判负）。"}
+                )
         else:
             self._toasts.append({"kind": "info", "title": "终局", "body": r})
 

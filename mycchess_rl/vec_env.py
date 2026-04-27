@@ -7,7 +7,7 @@ import numpy as np
 
 from mycchess_rl.encode_parallel import default_encode_workers
 from mycchess_rl.policy_inference import batched_sample_moves_masked, eval_value_stm
-from mycchess_rl.xqwl_state import XqwlGameState
+from mycchess_rl.xqwl_state import REP_RULE_VALUE_DRAWISH_ABS, XqwlGameState
 
 # 吃子塑形：以兵/卒为 1.0 的相对权重（与 ``reward_shaping_capture`` 基量相乘）
 _CAPTURE_MULT: dict[str, float] = {
@@ -44,6 +44,20 @@ def _captured_piece_before_move(g: XqwlGameState, mv: str) -> str | None:
 
 def _capture_multiplier(piece: str) -> float:
     return float(_CAPTURE_MULT.get(piece, 1.0))
+
+
+def _repetition_terminal_reward_for_last_mover(g: XqwlGameState) -> float:
+    """重复终局（含长将判负）对上一步走子方的标量回报：胜 +1、负 -1、和 0。
+
+    ``rep_value_if_any`` 为 XQWL 对**当前行棋方**（终局后应先走的一方）的重复局面分值：
+    明显为正则该行棋方在判例中得利 → 刚走完的一方失利 ``-1``；明显为负则反之 ``+1``。
+    """
+    v = int(g.rep_value_if_any())
+    if abs(v) <= REP_RULE_VALUE_DRAWISH_ABS:
+        return 0.0
+    if v > 0:
+        return -1.0
+    return 1.0
 
 
 def _opponent_king_char_after_move(g: XqwlGameState) -> str:
@@ -157,6 +171,8 @@ def collect_rollout_step(
             dones[i] = True
             if reason == "checkmate":
                 rewards[i] = 1.0
+            elif reason == "repetition_rule":
+                rewards[i] = float(_repetition_terminal_reward_for_last_mover(g))
             else:
                 rewards[i] = 0.0
         else:
