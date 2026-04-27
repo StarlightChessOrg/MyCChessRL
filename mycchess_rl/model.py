@@ -84,7 +84,7 @@ class JointPolicyValueNet(nn.Module):
 
 
 def torch_load_checkpoint(path: str | Path, map_location: torch.device | str) -> dict:
-    p = Path(p)
+    p = Path(path)
     try:
         return torch.load(p, map_location=map_location, weights_only=False)
     except TypeError:
