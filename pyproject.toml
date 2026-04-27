@@ -12,6 +12,7 @@ dependencies = [
   "numpy>=1.24",
   "torch>=2.1",
   "xmltodict>=0.13",
+  "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]

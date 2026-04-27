@@ -228,3 +228,72 @@ def next_collated_batch(
     while len(buf) < batch_size:
         buf.append(next(gen))
     return collate_joint_sl_batch(buf)
+
+
+def iter_epoch_joint_samples_shuffled(
+    filelist: list[str],
+    *,
+    policy_max_legal: int = POLICY_MAX_LEGAL_MOVES,
+    rng: random.Random | None = None,
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]]:
+    """单轮 epoch：打乱文件列表后 **每个文件只扫一遍**，产出全部有效样本（然后结束迭代）。"""
+    rnd = rng if rng is not None else random.Random()
+    fl = [str(x) for x in filelist]
+    if not fl:
+        raise ValueError("棋谱文件列表为空")
+    rnd.shuffle(fl)
+    yielded = False
+    for path in fl:
+        try:
+            for sample in iter_joint_sl_samples_from_cbf(path, policy_max_legal=policy_max_legal):
+                yielded = True
+                yield sample
+        except Exception:
+            continue
+    if not yielded:
+        raise RuntimeError(
+            "本 epoch 未产生任何样本：请确认 .cbf 格式且 Head/FEN 与标准开局一致（当前 xqwl 无法 set_fen）"
+        )
+
+
+def count_joint_sl_samples_in_file(
+    path: str,
+    *,
+    policy_max_legal: int = POLICY_MAX_LEGAL_MOVES,
+) -> int:
+    """单局 .cbf 内可产生的 SL 样本数（与 ``iter_joint_sl_samples_from_cbf`` 一致）。"""
+    n = 0
+    try:
+        for _ in iter_joint_sl_samples_from_cbf(path, policy_max_legal=policy_max_legal):
+            n += 1
+    except Exception:
+        return 0
+    return int(n)
+
+
+def count_joint_sl_samples_in_paths(
+    paths: list[str],
+    *,
+    policy_max_legal: int = POLICY_MAX_LEGAL_MOVES,
+) -> int:
+    """逐文件计数总和（顺序无关）。"""
+    return int(sum(count_joint_sl_samples_in_file(p, policy_max_legal=policy_max_legal) for p in paths))
+
+
+def iter_collated_batches_from_finite_samples(
+    sample_iter: Iterator[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]],
+    batch_size: int,
+    *,
+    drop_last: bool = False,
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """将有限样本迭代器切成 batch；默认 **保留** 最后一个不满 ``batch_size`` 的 batch。"""
+    if batch_size <= 0:
+        raise ValueError("batch_size 须为正整数")
+    buf: list[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]] = []
+    for s in sample_iter:
+        buf.append(s)
+        if len(buf) >= batch_size:
+            yield collate_joint_sl_batch(buf)
+            buf = []
+    if buf and not drop_last:
+        yield collate_joint_sl_batch(buf)

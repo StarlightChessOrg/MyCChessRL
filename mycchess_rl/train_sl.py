@@ -1,6 +1,6 @@
 """XML ``.cbf`` 监督学习：联合合法槽 softmax + 价值 MSE。
 
-指定棋谱目录后训练；``--checkpoint`` 可选：省略则在 ``--save-dir`` 下自动生成 ``bootstrap.pt`` 并开始训；若指向已有 ``.pt`` 则加载权重，若文件为本脚本保存的 SL 档（含 ``epoch``）则同时续优化器与进度。训练过程在 ``save_dir`` 下写 ``best.pt`` / ``last.pt``（YOLO 习惯）。
+指定棋谱目录后训练；默认 **每 epoch 遍历 train/val 全部样本**（打乱文件顺序、每文件一轮）后再写 ``best.pt`` / ``last.pt``；训练/验证进度用 ``tqdm``。``--quick-epoch`` 可改回固定批次数。``--checkpoint`` 可选：省略则在 ``--save-dir`` 下自动生成 ``bootstrap.pt``；SL 存盘可续优化器与 ``epoch``/``global_step``。
 """
 from __future__ import annotations
 
@@ -13,11 +13,15 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import argparse
+import hashlib
+import json
 import logging
 import random
 import sys
 import time
 from pathlib import Path
+
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -31,8 +35,11 @@ except Exception:
 
 from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play, torch_load_checkpoint
 from mycchess_rl.sl_data import (
+    count_joint_sl_samples_in_file,
     discover_cbf_files,
     infinite_shuffled_joint_samples,
+    iter_collated_batches_from_finite_samples,
+    iter_epoch_joint_samples_shuffled,
     next_collated_batch,
     split_paths_train_test,
 )
@@ -125,6 +132,64 @@ def _raw_has_sl_epoch(raw: dict) -> bool:
     return True
 
 
+_SL_COUNT_CACHE = "sl_sample_counts.json"
+
+
+def _paths_fingerprint(paths: list[str]) -> str:
+    h = hashlib.sha256()
+    for p in sorted(paths):
+        h.update(p.encode("utf-8", errors="surrogateescape"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _resolve_sample_counts(
+    save_dir: Path,
+    train_files: list[str],
+    val_files: list[str],
+    policy_max_legal: int,
+    *,
+    force_recount: bool,
+) -> tuple[int, int]:
+    """返回 (n_train_samples, n_val_samples)；可用 ``save_dir/sl_sample_counts.json`` 缓存避免重复全量扫描。"""
+    cache_path = save_dir / _SL_COUNT_CACHE
+    t_fp = _paths_fingerprint(train_files)
+    v_fp = _paths_fingerprint(val_files)
+    if not force_recount and cache_path.is_file():
+        try:
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (
+                raw.get("train_fingerprint") == t_fp
+                and raw.get("val_fingerprint") == v_fp
+                and int(raw.get("policy_max_legal", -1)) == int(policy_max_legal)
+            ):
+                return int(raw["train_samples"]), int(raw["val_samples"])
+        except (OSError, TypeError, ValueError, KeyError):
+            pass
+    n_train = 0
+    for p in tqdm(train_files, desc="统计 train 样本", leave=True):
+        n_train += count_joint_sl_samples_in_file(p, policy_max_legal=policy_max_legal)
+    n_val = 0
+    for p in tqdm(val_files, desc="统计 val 样本", leave=True):
+        n_val += count_joint_sl_samples_in_file(p, policy_max_legal=policy_max_legal)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "train_fingerprint": t_fp,
+                "val_fingerprint": v_fp,
+                "policy_max_legal": int(policy_max_legal),
+                "train_samples": n_train,
+                "val_samples": n_val,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return n_train, n_val
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="MyCChessRL：cbf 监督学习（JointPolicyValueNet）")
     p.add_argument("--cbf-root", type=Path, default=None, help="递归搜集该目录下 .cbf（与 --cbf-manifest 二选一）")
@@ -144,8 +209,28 @@ def main() -> None:
         default=3,
         help="本轮要跑的 epoch 数（续训时在已完成的 epoch 之后再跑这么多个）",
     )
-    p.add_argument("--n-batch-train", type=int, default=200, help="每 epoch 训练批次数（主进程从打乱棋谱流中组 batch）")
-    p.add_argument("--n-batch-val", type=int, default=30, help="每 epoch 验证批次数")
+    p.add_argument(
+        "--quick-epoch",
+        action="store_true",
+        help="快速模式：每 epoch 只跑固定批次数（--n-batch-train / --n-batch-val），不遍历全数据集",
+    )
+    p.add_argument(
+        "--n-batch-train",
+        type=int,
+        default=200,
+        help="仅与 --quick-epoch 同时使用：每 epoch 训练批次数",
+    )
+    p.add_argument(
+        "--n-batch-val",
+        type=int,
+        default=30,
+        help="仅与 --quick-epoch 同时使用：每 epoch 验证批次数",
+    )
+    p.add_argument(
+        "--recount-samples",
+        action="store_true",
+        help="忽略 save-dir 下样本数缓存，强制重新统计 train/val 条数",
+    )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--value-loss-weight", type=float, default=0.25, help="价值 MSE 相对策略 CE 权重")
@@ -195,12 +280,20 @@ def main() -> None:
         _LOG.error("请指定 --cbf-root 或 --cbf-manifest")
         raise SystemExit(2)
 
-    _LOG.info(
-        "训练吞吐说明: 每 epoch --n-batch-train=%d 批 × --batch-size=%d 条（与 MyElephant 相同主进程打乱流，无 DataLoader）；"
-        "train/val 为棋谱文件个数；仅标准开局 FEN 的 .cbf 产生样本。",
-        int(args.n_batch_train),
-        int(args.batch_size),
-    )
+    if args.quick_epoch:
+        _LOG.info(
+            "监督学习（快速 epoch）：每轮 train=%d 批、val=%d 批 × batch_size=%d；主进程流式组 batch，无 DataLoader。",
+            int(args.n_batch_train),
+            int(args.n_batch_val),
+            int(args.batch_size),
+        )
+    else:
+        _LOG.info(
+            "监督学习（完整 epoch）：每轮 **先扫完 train 全样本、再扫完 val 全样本** 后写入 best.pt / last.pt；"
+            "batch_size=%d；样本条数缓存在 %s（可用 --recount-samples 强制重算）。",
+            int(args.batch_size),
+            _SL_COUNT_CACHE,
+        )
 
     device = torch.device("cpu")
     if args.gpu >= 0 and torch.cuda.is_available():
@@ -250,12 +343,37 @@ def main() -> None:
     for g in opt.param_groups:
         g["lr"] = float(args.lr)
     pm = model.policy_max_legal
+    bs = int(args.batch_size)
     train_rng = random.Random(int(args.data_seed))
     val_rng = random.Random(int(args.data_seed) + 1_000_003)
-    train_gen = infinite_shuffled_joint_samples(
-        train_files, policy_max_legal=pm, rng=train_rng
-    )
-    val_gen = infinite_shuffled_joint_samples(val_files, policy_max_legal=pm, rng=val_rng)
+    train_gen = None
+    val_gen = None
+    if args.quick_epoch:
+        train_gen = infinite_shuffled_joint_samples(train_files, policy_max_legal=pm, rng=train_rng)
+        val_gen = infinite_shuffled_joint_samples(val_files, policy_max_legal=pm, rng=val_rng)
+
+    n_train_samples = n_val_samples = 0
+    n_train_batches = n_val_batches = 0
+    if not args.quick_epoch:
+        n_train_samples, n_val_samples = _resolve_sample_counts(
+            save_dir,
+            train_files,
+            val_files,
+            pm,
+            force_recount=bool(args.recount_samples),
+        )
+        if n_train_samples <= 0:
+            raise RuntimeError("train 集样本数为 0：请检查 .cbf 与标准开局 FEN")
+        n_train_batches = (n_train_samples + bs - 1) // bs
+        n_val_batches = (n_val_samples + bs - 1) // bs if n_val_samples > 0 else 0
+        _LOG.info(
+            "样本计数: train=%d 条 → %d 批 | val=%d 条 → %d 批",
+            n_train_samples,
+            n_train_batches,
+            n_val_samples,
+            n_val_batches,
+        )
+
     t0 = time.perf_counter()
 
     for k in range(int(args.epochs)):
@@ -263,15 +381,26 @@ def main() -> None:
         exp_loss = _ExpVal()
         exp_acc = _ExpVal()
         model.train()
-        for bi in range(int(args.n_batch_train)):
-            x_np, m_np, yi_np, vs_np, hv_np = next_collated_batch(
-                train_gen, int(args.batch_size)
-            )
 
-            x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(
-                x_np, m_np, yi_np, vs_np, hv_np, device
+        if args.quick_epoch:
+            train_iter = (
+                next_collated_batch(train_gen, bs) for _ in range(int(args.n_batch_train))
             )
+            train_total = int(args.n_batch_train)
+        else:
+            ep_tr_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 7)
+            train_iter = iter_collated_batches_from_finite_samples(
+                iter_epoch_joint_samples_shuffled(
+                    train_files, policy_max_legal=pm, rng=ep_tr_rng
+                ),
+                bs,
+                drop_last=False,
+            )
+            train_total = n_train_batches
 
+        pbar_tr = tqdm(train_iter, total=train_total, desc=f"epoch {epoch} train", leave=True, mininterval=0.5)
+        for x_np, m_np, yi_np, vs_np, hv_np in pbar_tr:
+            x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(x_np, m_np, yi_np, vs_np, hv_np, device)
             opt.zero_grad(set_to_none=True)
             logits_m, v_pred = model(x)
             logits_masked = logits_m.masked_fill(~mask, -1e9)
@@ -285,38 +414,40 @@ def main() -> None:
             loss.backward()
             opt.step()
             global_step += 1
-
             with torch.no_grad():
                 pred = logits_masked.argmax(dim=-1)
                 acc = float((pred == tgt).float().mean().item())
             exp_loss.update(float(loss.item()))
             exp_acc.update(acc * 100.0)
+            pbar_tr.set_postfix(loss=f"{float(loss.item()):.4f}", acc=f"{acc * 100.0:.2f}%", step=global_step)
 
-            if (bi + 1) % 50 == 0 or bi == 0:
-                el = exp_loss.get()
-                ea = exp_acc.get()
-                _LOG.info(
-                    "epoch %d train batch %d/%d | loss=%.4f (p=%.4f v=%.4f) | acc~%.2f%% | step=%d",
-                    epoch,
-                    bi + 1,
-                    int(args.n_batch_train),
-                    float(loss.item()),
-                    float(loss_p.item()),
-                    float(loss_v.item()) if has_v.any() else 0.0,
-                    acc * 100.0,
-                    global_step,
-                )
-                if el is not None and ea is not None:
-                    _LOG.info("  EMA loss=%s acc%%=%s", el, ea)
+        el = exp_loss.get()
+        ea = exp_acc.get()
+        if el is not None and ea is not None:
+            _LOG.info("epoch %d train 结束 | EMA loss=%s acc%%=%s | step=%d", epoch, el, ea, global_step)
 
         model.eval()
         v_losses: list[float] = []
         v_accs: list[float] = []
         with torch.no_grad():
-            for _ in range(int(args.n_batch_val)):
-                x_np, m_np, yi_np, vs_np, hv_np = next_collated_batch(
-                    val_gen, int(args.batch_size)
+            if args.quick_epoch:
+                val_iter = (next_collated_batch(val_gen, bs) for _ in range(int(args.n_batch_val)))
+                val_total = int(args.n_batch_val)
+            elif n_val_batches <= 0:
+                val_iter = iter(())
+                val_total = 0
+            else:
+                ep_va_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 900_017)
+                val_iter = iter_collated_batches_from_finite_samples(
+                    iter_epoch_joint_samples_shuffled(
+                        val_files, policy_max_legal=pm, rng=ep_va_rng
+                    ),
+                    bs,
+                    drop_last=False,
                 )
+                val_total = n_val_batches
+            pbar_va = tqdm(val_iter, total=val_total, desc=f"epoch {epoch} val", leave=True, mininterval=0.5)
+            for x_np, m_np, yi_np, vs_np, hv_np in pbar_va:
                 x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(
                     x_np, m_np, yi_np, vs_np, hv_np, device
                 )
@@ -332,15 +463,19 @@ def main() -> None:
                 pred = logits_masked.argmax(dim=-1)
                 v_losses.append(float(loss.item()))
                 v_accs.append(float((pred == tgt).float().mean().item() * 100.0))
+                pbar_va.set_postfix(loss=f"{float(loss.item()):.4f}", acc=f"{(pred == tgt).float().mean().item() * 100.0:.2f}%")
 
-        val_m = float(np.mean(v_losses)) if v_losses else 0.0
-        val_a = float(np.mean(v_accs)) if v_accs else 0.0
-        _LOG.info("epoch %d val | loss_mean=%.4f acc_mean=%.2f%%", epoch, val_m, val_a)
-        if val_m < best_val:
-            best_val = val_m
-            out = save_dir / "best.pt"
-            _save_ckpt(out, model, opt, epoch=epoch, global_step=global_step, best_val=best_val)
-            _LOG.info("已写入 best -> %s", out.resolve())
+        if v_losses:
+            val_m = float(np.mean(v_losses))
+            val_a = float(np.mean(v_accs))
+            _LOG.info("epoch %d val | loss_mean=%.4f acc_mean=%.2f%%", epoch, val_m, val_a)
+            if val_m < best_val:
+                best_val = val_m
+                out = save_dir / "best.pt"
+                _save_ckpt(out, model, opt, epoch=epoch, global_step=global_step, best_val=best_val)
+                _LOG.info("已写入 best -> %s", out.resolve())
+        else:
+            _LOG.info("epoch %d val | 无验证 batch，跳过 best.pt 更新", epoch)
 
         last = save_dir / "last.pt"
         _save_ckpt(last, model, opt, epoch=epoch, global_step=global_step, best_val=best_val)
