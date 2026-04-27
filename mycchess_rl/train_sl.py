@@ -33,6 +33,7 @@ try:
 except Exception:
     pass
 
+from mycchess_rl.encode_parallel import default_encode_workers
 from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play, torch_load_checkpoint
 from mycchess_rl.sl_data import (
     count_joint_sl_samples_paths_parallel,
@@ -40,6 +41,7 @@ from mycchess_rl.sl_data import (
     iter_collated_batches_from_finite_samples,
     iter_epoch_joint_samples_shuffled,
     split_paths_train_test,
+    thread_prefetch_iterator,
 )
 
 _LOG = logging.getLogger("mycchess_rl.train_sl")
@@ -225,6 +227,18 @@ def main() -> None:
         default=0,
         help="统计样本条数时的进程数；0 表示自动 min(16, CPU)。1 表示单进程。使用 spawn 子进程，与主进程已加载 CUDA 兼容。",
     )
+    p.add_argument(
+        "--encode-workers",
+        type=int,
+        default=0,
+        help="每个 batch 内根平面编码线程数；0 表示自动（约 min(8, CPU)）；1 强制单线程。样本在回放阶段仅打包，编码在 collate 并行。",
+    )
+    p.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=4,
+        help="后台线程预取已 collate 的 batch 数，与 GPU 前向重叠；0 关闭。",
+    )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--value-loss-weight", type=float, default=0.25, help="价值 MSE 相对策略 CE 权重")
@@ -277,7 +291,8 @@ def main() -> None:
     _LOG.info(
         "监督学习（YOLO 式 epoch）：每轮 train 全量 → val 全量 → 更优则 best.pt，且每轮 last.pt；"
         "batch_size=%d；样本条数缓存在 %s（--recount-samples 强制重算）；"
-        "首次统计可用多进程（--count-workers，默认自动）。",
+        "首次统计可用多进程（--count-workers，默认自动）；"
+        "加载侧 collate 多线程编码（--encode-workers）与 batch 预取（--prefetch-batches）。",
         int(args.batch_size),
         _SL_COUNT_CACHE,
     )
@@ -334,6 +349,9 @@ def main() -> None:
     cw = int(args.count_workers)
     if cw <= 0:
         cw = max(1, min(16, (os.cpu_count() or 4)))
+    ew_arg = int(args.encode_workers)
+    encode_workers = default_encode_workers() if ew_arg <= 0 else max(1, ew_arg)
+    prefetch_batches = max(0, int(args.prefetch_batches))
 
     epoch = -1
     training_started = False
@@ -362,6 +380,11 @@ def main() -> None:
             n_val_samples,
             n_val_batches,
         )
+        _LOG.info(
+            "数据吞吐: encode_workers=%d | prefetch_batches=%d",
+            encode_workers,
+            prefetch_batches,
+        )
 
         for k in range(int(args.epochs)):
             epoch = epoch_begin + k
@@ -370,10 +393,16 @@ def main() -> None:
             model.train()
 
             ep_tr_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 7)
-            train_iter = iter_collated_batches_from_finite_samples(
+            train_base = iter_collated_batches_from_finite_samples(
                 iter_epoch_joint_samples_shuffled(train_files, policy_max_legal=pm, rng=ep_tr_rng),
                 bs,
                 drop_last=False,
+                encode_workers=encode_workers,
+            )
+            train_iter = (
+                thread_prefetch_iterator(train_base, prefetch_batches)
+                if prefetch_batches > 0
+                else train_base
             )
             pbar_tr = tqdm(
                 train_iter,
@@ -436,12 +465,18 @@ def main() -> None:
                     val_total = 0
                 else:
                     ep_va_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 900_017)
-                    val_iter = iter_collated_batches_from_finite_samples(
+                    val_base = iter_collated_batches_from_finite_samples(
                         iter_epoch_joint_samples_shuffled(
                             val_files, policy_max_legal=pm, rng=ep_va_rng
                         ),
                         bs,
                         drop_last=False,
+                        encode_workers=encode_workers,
+                    )
+                    val_iter = (
+                        thread_prefetch_iterator(val_base, prefetch_batches)
+                        if prefetch_batches > 0
+                        else val_base
                     )
                     val_total = n_val_batches
                 pbar_va = tqdm(

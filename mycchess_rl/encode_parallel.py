@@ -117,6 +117,19 @@ def encode_states_thread_pool(states: list[Any], workers: int) -> np.ndarray:
     return np.stack(planes, axis=0)
 
 
+def encode_packed_list_thread_pool(packed_list: list[tuple], workers: int) -> np.ndarray:
+    """对已是 ``pack_planes_state`` 结果的列表做多线程 ``encode_packed_planes``（供 SL collate 等复用）。"""
+    if not packed_list:
+        return np.zeros((0, 0, 0, 0), dtype=np.float32)
+    w_pool = resolve_encode_workers(int(workers), len(packed_list))
+    if w_pool <= 1:
+        planes = [encode_packed_planes(p) for p in packed_list]
+    else:
+        pool = _ensure_thread_pool(w_pool)
+        planes = list(pool.map(encode_packed_planes, packed_list))
+    return np.stack(planes, axis=0)
+
+
 def encode_states_parallel(states: list[Any], workers: int) -> np.ndarray:
     """兼容旧名：等同 ``encode_states_process_pool``。"""
     return encode_states_process_pool(states, workers)

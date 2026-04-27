@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import queue
 import random
+import threading
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, TypeVar
 
 import numpy as np
 import xmltodict
@@ -21,9 +23,39 @@ from mycchess_rl.chess.rationale import (
     VALUE_LABEL_IGNORE,
     stm_outcome_class_from_red_outcome,
 )
-from mycchess_rl.encode_parallel import encode_states_inline
+from mycchess_rl.encode_parallel import encode_packed_list_thread_pool, pack_planes_state
 from mycchess_rl.fen_parse import FULL_INIT_FEN, parse_fen_board
 from mycchess_rl.xqwl_state import XqwlGameState
+
+T = TypeVar("T")
+_PREFETCH_SENTINEL = object()
+
+
+def thread_prefetch_iterator(it: Iterator[T], prefetch: int) -> Iterator[T]:
+    """后台线程从 ``it`` 预取若干项到队列，主线程 ``next`` 可与 GPU 前向重叠（同进程、无 pickle）。"""
+    if prefetch <= 0:
+        yield from it
+        return
+    q: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(prefetch)))
+
+    def _worker() -> None:
+        try:
+            for item in it:
+                q.put(item)
+        except BaseException as e:
+            q.put(e)
+        finally:
+            q.put(_PREFETCH_SENTINEL)
+
+    th = threading.Thread(target=_worker, daemon=True, name="sl_batch_prefetch")
+    th.start()
+    while True:
+        item = q.get()
+        if item is _PREFETCH_SENTINEL:
+            break
+        if isinstance(item, BaseException):
+            raise item
+        yield item
 
 
 def discover_cbf_files(root: Path | str, *, recursive: bool = True) -> list[str]:
@@ -120,9 +152,10 @@ def iter_joint_sl_samples_from_cbf(
     path: str | Path,
     *,
     policy_max_legal: int = POLICY_MAX_LEGAL_MOVES,
-) -> Iterator[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]]:
+) -> Iterator[tuple[Any, np.ndarray, np.int64, np.float32, bool]]:
     """
     在 **标准起始 FEN** 上逐步回放一局；每步 yield 走子**前**的样本。
+    首元素为 ``pack_planes_state(st)`` 的纯数据元组，根平面在 ``collate_joint_sl_batch`` 中按 batch 并行编码。
     解析路径与 MyElephant ``convert_game`` / icyElephant 棋谱结构一致（``xmltodict``）。
     """
     doc: dict[str, Any] | None = None
@@ -163,7 +196,7 @@ def iter_joint_sl_samples_from_cbf(
             mask = np.zeros((policy_max_legal,), dtype=np.bool_)
             mask[: len(legs)] = True
             idx = int(legs.index(mv))
-            chw = np.array(encode_states_inline([st])[0], dtype=np.float32, copy=True)
+            packed = pack_planes_state(st)
             stm_cls = int(stm_outcome_class_from_red_outcome(red_cls, bool(st.red_to_move)))
             if stm_cls == VALUE_LABEL_IGNORE:
                 has_v = False
@@ -176,7 +209,7 @@ def iter_joint_sl_samples_from_cbf(
                     vs = np.float32(-1.0)
                 else:
                     vs = np.float32(0.0)
-            yield (chw, mask, np.int64(idx), vs, has_v)
+            yield (packed, mask, np.int64(idx), vs, has_v)
             if not st.make_move_iccs(mv):
                 return
     finally:
@@ -189,7 +222,7 @@ def infinite_shuffled_joint_samples(
     *,
     policy_max_legal: int = POLICY_MAX_LEGAL_MOVES,
     rng: random.Random | None = None,
-) -> Iterator[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]]:
+) -> Iterator[tuple[Any, np.ndarray, np.int64, np.float32, bool]]:
     """与 MyElephant ``SuccessorPolicyIterableDataset`` 同构：无限打乱文件列表后逐局 yield 样本（主进程，无 DataLoader）。"""
     rnd = rng if rng is not None else random.Random()
     fl = [str(x) for x in filelist]
@@ -212,9 +245,16 @@ def infinite_shuffled_joint_samples(
 
 
 def collate_joint_sl_batch(
-    batch: list[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]],
+    batch: list[tuple[Any, np.ndarray, np.int64, np.float32, bool]],
+    *,
+    encode_workers: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    x = np.stack([np.ascontiguousarray(np.array(b[0], dtype=np.float32, copy=True)) for b in batch], axis=0)
+    first = batch[0][0]
+    if isinstance(first, np.ndarray) and first.ndim == 3:
+        x = np.stack([np.ascontiguousarray(np.array(b[0], dtype=np.float32, copy=True)) for b in batch], axis=0)
+    else:
+        packeds = [b[0] for b in batch]
+        x = np.ascontiguousarray(encode_packed_list_thread_pool(packeds, encode_workers), dtype=np.float32)
     m = np.stack([np.ascontiguousarray(np.array(b[1], dtype=np.bool_, copy=True)) for b in batch], axis=0)
     yi = np.stack([np.int64(b[2]) for b in batch], axis=0)
     vs = np.stack([np.float32(b[3]) for b in batch], axis=0)
@@ -223,14 +263,16 @@ def collate_joint_sl_batch(
 
 
 def next_collated_batch(
-    gen: Iterator[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]],
+    gen: Iterator[tuple[Any, np.ndarray, np.int64, np.float32, bool]],
     batch_size: int,
+    *,
+    encode_workers: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """从生成器凑满 ``batch_size`` 条后 ``collate``（主线程，无 DataLoader）。"""
-    buf: list[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]] = []
+    buf: list[tuple[Any, np.ndarray, np.int64, np.float32, bool]] = []
     while len(buf) < batch_size:
         buf.append(next(gen))
-    return collate_joint_sl_batch(buf)
+    return collate_joint_sl_batch(buf, encode_workers=encode_workers)
 
 
 def iter_epoch_joint_samples_shuffled(
@@ -238,7 +280,7 @@ def iter_epoch_joint_samples_shuffled(
     *,
     policy_max_legal: int = POLICY_MAX_LEGAL_MOVES,
     rng: random.Random | None = None,
-) -> Iterator[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]]:
+) -> Iterator[tuple[Any, np.ndarray, np.int64, np.float32, bool]]:
     """单轮 epoch：打乱文件列表后 **每个文件只扫一遍**，产出全部有效样本（然后结束迭代）。"""
     rnd = rng if rng is not None else random.Random()
     fl = [str(x) for x in filelist]
@@ -341,19 +383,20 @@ def count_joint_sl_samples_paths_parallel(
 
 
 def iter_collated_batches_from_finite_samples(
-    sample_iter: Iterator[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]],
+    sample_iter: Iterator[tuple[Any, np.ndarray, np.int64, np.float32, bool]],
     batch_size: int,
     *,
     drop_last: bool = False,
+    encode_workers: int = 1,
 ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """将有限样本迭代器切成 batch；默认 **保留** 最后一个不满 ``batch_size`` 的 batch。"""
     if batch_size <= 0:
         raise ValueError("batch_size 须为正整数")
-    buf: list[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]] = []
+    buf: list[tuple[Any, np.ndarray, np.int64, np.float32, bool]] = []
     for s in sample_iter:
         buf.append(s)
         if len(buf) >= batch_size:
-            yield collate_joint_sl_batch(buf)
+            yield collate_joint_sl_batch(buf, encode_workers=encode_workers)
             buf = []
     if buf and not drop_last:
-        yield collate_joint_sl_batch(buf)
+        yield collate_joint_sl_batch(buf, encode_workers=encode_workers)
