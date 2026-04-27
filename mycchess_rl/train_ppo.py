@@ -11,7 +11,13 @@ import numpy as np
 import torch
 
 from mycchess_rl.encode_parallel import default_encode_workers
-from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play, torch_load_checkpoint
+from mycchess_rl.model import (
+    JointPolicyValueConvTrm,
+    JointPolicyValueNet,
+    load_policy_value_for_play,
+    policy_value_checkpoint_meta,
+    torch_load_checkpoint,
+)
 from mycchess_rl.policy_inference import (
     batched_encode_roots,
     batched_joint_logprob_on_moves,
@@ -167,9 +173,32 @@ def main() -> None:
         default=0.025,
         help="吃子奖励基量（兵卒=1×），车马炮等按子种加权；0=关闭",
     )
+    p.add_argument(
+        "--arch",
+        type=str,
+        choices=("resnet", "conv_transformer"),
+        default="resnet",
+        help="无 checkpoint 时的随机初始化骨干：resnet 或 卷积茎+浅宽 Transformer（续训时以权重文件为准）",
+    )
+    p.add_argument("--trm-d-model", type=int, default=384, help="仅 conv_transformer：token 宽度")
+    p.add_argument("--trm-layers", type=int, default=2, help="仅 conv_transformer：TransformerEncoder 层数")
+    p.add_argument("--trm-nhead", type=int, default=8, help="仅 conv_transformer：注意力头数（须整除 d_model）")
+    p.add_argument(
+        "--trm-ff",
+        type=int,
+        default=0,
+        help="仅 conv_transformer：FFN 隐维；0 表示 4×d_model",
+    )
+    p.add_argument("--stem-channels", type=int, default=96, help="仅 conv_transformer：卷积茎通道")
+    p.add_argument("--stem-num-res", type=int, default=2, help="仅 conv_transformer：茎上 ResBlock 个数")
     args = p.parse_args()
 
     _setup_logging(args.log_file)
+    if str(args.arch).lower() == "conv_transformer":
+        dm, nh = int(args.trm_d_model), int(args.trm_nhead)
+        if dm % nh != 0:
+            _LOG.error("conv_transformer 要求 --trm-d-model（%d）能被 --trm-nhead（%d）整除", dm, nh)
+            raise SystemExit(2)
     save_dir: Path = args.save_dir
     save_dir.mkdir(parents=True, exist_ok=True)
     save_every = max(0, int(args.save_every))
@@ -201,22 +230,41 @@ def main() -> None:
         if args.resume:
             _LOG.error("--resume 需要 --checkpoint，或先有 %s", (save_dir / "last.pt").resolve())
             raise SystemExit(2)
-        model = JointPolicyValueNet().to(device)
+        if str(args.arch).lower() == "conv_transformer":
+            trm_ff = int(args.trm_ff) if int(args.trm_ff) > 0 else None
+            model = JointPolicyValueConvTrm(
+                stem_channels=int(args.stem_channels),
+                stem_num_res=int(args.stem_num_res),
+                d_model=int(args.trm_d_model),
+                nhead=int(args.trm_nhead),
+                trm_layers=int(args.trm_layers),
+                dim_feedforward=trm_ff,
+            ).to(device)
+        else:
+            model = JointPolicyValueNet().to(device)
         from mycchess_rl.chess import FEATURE_LIST
 
         flist = {"red": list(FEATURE_LIST["red"]), "black": list(FEATURE_LIST["black"])}
         model.eval()
-        _LOG.info("随机初始化策略网络")
+        _LOG.info("随机初始化策略网络 arch=%s", getattr(model, "arch", args.arch))
 
     n_params = sum(p.numel() for p in model.parameters())
+    arch_l = str(getattr(model, "arch", "resnet"))
+    if arch_l == "conv_transformer":
+        arch_desc = (
+            f"Conv+Trm in_ch={model.in_channels} d_model={getattr(model, 'd_model', '?')} "
+            f"trm_layers={getattr(model, 'trm_layers', '?')} stem_ch={getattr(model, 'stem_channels', '?')}"
+        )
+    else:
+        arch_desc = f"ResNet in_ch={model.in_channels} filters={model.filters} res={model.num_res_layers}"
     _LOG.info(
-        "设备=%s | n_env=%d steps=%d updates=%d lr=%g | ResNet in_ch=%d 参数量=%s",
+        "设备=%s | n_env=%d steps=%d updates=%d lr=%g | %s | 参数量=%s",
         device,
         args.n_env,
         args.steps,
         args.updates,
         args.lr,
-        model.in_channels,
+        arch_desc,
         f"{n_params:,}",
     )
     if device.type == "cuda":
@@ -286,11 +334,9 @@ def main() -> None:
     interrupted = False
 
     def _training_checkpoint_dict(finished_upd: int) -> dict:
-        return {
+        d = {
             "model": model.state_dict(),
             "in_channels": model.in_channels,
-            "num_res_layers": model.num_res_layers,
-            "filters": model.filters,
             "policy_max_legal": model.policy_max_legal,
             "value_scale": model.value_scale,
             "update": int(finished_upd),
@@ -298,6 +344,8 @@ def main() -> None:
             "kind": "ppo",
             "best_loss_total": float(best_loss_total),
         }
+        d.update(policy_value_checkpoint_meta(model))
+        return d
 
     def _save_checkpoint_file(path: Path, finished_upd: int) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 try:
@@ -34,7 +35,13 @@ except Exception:
     pass
 
 from mycchess_rl.encode_parallel import default_encode_workers
-from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play, torch_load_checkpoint
+from mycchess_rl.model import (
+    JointPolicyValueConvTrm,
+    JointPolicyValueNet,
+    load_policy_value_for_play,
+    policy_value_checkpoint_meta,
+    torch_load_checkpoint,
+)
 from mycchess_rl.sl_data import (
     count_joint_sl_samples_paths_parallel,
     discover_cbf_files,
@@ -98,7 +105,7 @@ class _ExpVal:
 
 def _save_ckpt(
     path: Path,
-    model: JointPolicyValueNet,
+    model: nn.Module,
     opt: torch.optim.Optimizer,
     *,
     epoch: int,
@@ -106,22 +113,19 @@ def _save_ckpt(
     best_val: float,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": opt.state_dict(),
-            "in_channels": model.in_channels,
-            "num_res_layers": model.num_res_layers,
-            "filters": model.filters,
-            "policy_max_legal": model.policy_max_legal,
-            "value_scale": model.value_scale,
-            "epoch": int(epoch),
-            "global_step": int(global_step),
-            "best_val_loss": float(best_val),
-            "kind": "sl",
-        },
-        path,
-    )
+    body: dict = {
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "in_channels": model.in_channels,
+        "policy_max_legal": model.policy_max_legal,
+        "value_scale": model.value_scale,
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "best_val_loss": float(best_val),
+        "kind": "sl",
+    }
+    body.update(policy_value_checkpoint_meta(model))
+    torch.save(body, path)
 
 
 def _raw_has_sl_epoch(raw: dict) -> bool:
@@ -201,7 +205,7 @@ def _resolve_sample_counts(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="MyCChessRL：cbf 监督学习（JointPolicyValueNet）")
+    p = argparse.ArgumentParser(description="MyCChessRL：cbf 监督学习（JointPolicyValueNet / Conv+Transformer）")
     p.add_argument("--cbf-root", type=Path, default=None, help="递归搜集该目录下 .cbf（与 --cbf-manifest 二选一）")
     p.add_argument(
         "--cbf-manifest",
@@ -259,11 +263,30 @@ def main() -> None:
     )
     p.add_argument("--save-dir", type=Path, default=Path("runs"))
     p.add_argument("--log-file", type=Path, default=None)
+    p.add_argument(
+        "--arch",
+        type=str,
+        choices=("resnet", "conv_transformer"),
+        default="resnet",
+        help="无 --checkpoint 时 bootstrap 的骨干；从已有 .pt 加载时以权重内 arch 为准",
+    )
+    p.add_argument("--trm-d-model", type=int, default=384)
+    p.add_argument("--trm-layers", type=int, default=2)
+    p.add_argument("--trm-nhead", type=int, default=8)
+    p.add_argument("--trm-ff", type=int, default=0, help="0=4×d_model")
+    p.add_argument("--stem-channels", type=int, default=96)
+    p.add_argument("--stem-num-res", type=int, default=2)
     args = p.parse_args()
 
     _setup_logging(args.log_file)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    if str(args.arch).lower() == "conv_transformer":
+        dm, nh = int(args.trm_d_model), int(args.trm_nhead)
+        if dm % nh != 0:
+            _LOG.error("conv_transformer 要求 --trm-d-model（%d）能被 --trm-nhead（%d）整除", dm, nh)
+            raise SystemExit(2)
 
     if args.cbf_root is not None:
         all_cbf = discover_cbf_files(args.cbf_root, recursive=not args.cbf_shallow)
@@ -315,7 +338,18 @@ def main() -> None:
 
     ck = args.checkpoint
     if ck is None:
-        model = JointPolicyValueNet().to(device)
+        if str(args.arch).lower() == "conv_transformer":
+            trm_ff = int(args.trm_ff) if int(args.trm_ff) > 0 else None
+            model = JointPolicyValueConvTrm(
+                stem_channels=int(args.stem_channels),
+                stem_num_res=int(args.stem_num_res),
+                d_model=int(args.trm_d_model),
+                nhead=int(args.trm_nhead),
+                trm_layers=int(args.trm_layers),
+                dim_feedforward=trm_ff,
+            ).to(device)
+        else:
+            model = JointPolicyValueNet().to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
         boot = save_dir / "bootstrap.pt"
         _save_ckpt(boot, model, opt, epoch=-1, global_step=0, best_val=float("inf"))

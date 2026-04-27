@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from mycchess_rl.model import JointPolicyValueNet, policy_temperature_scalar
+from mycchess_rl.model import PolicyValueBackbone, policy_temperature_scalar
 
 
 @dataclass
@@ -45,7 +45,7 @@ def compute_gae(
 
 
 def _ppo_forward_loss_joint(
-    model: JointPolicyValueNet,
+    model: PolicyValueBackbone,
     obs: torch.Tensor,
     legal_mask: torch.Tensor,
     action_idx: torch.Tensor,
@@ -97,7 +97,7 @@ def _ppo_forward_loss_joint(
 
 
 def policy_value_loss_step(
-    model: JointPolicyValueNet,
+    model: PolicyValueBackbone,
     opt: torch.optim.Optimizer,
     obs: torch.Tensor,
     legal_mask: torch.Tensor,

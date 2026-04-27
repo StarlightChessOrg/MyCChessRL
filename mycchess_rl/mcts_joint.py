@@ -10,7 +10,7 @@ from mycchess_rl.policy_inference import infer_joint_policy_prior_and_value
 from mycchess_rl.xqwl_state import XqwlGameState
 
 if TYPE_CHECKING:
-    from mycchess_rl.model import JointPolicyValueNet
+    from mycchess_rl.model import PolicyValueBackbone
 
 
 @dataclass(slots=True)
@@ -53,7 +53,7 @@ class MCTSNode:
 
     def expand(
         self,
-        model: JointPolicyValueNet,
+        model: PolicyValueBackbone,
         device: Any,
         flist: dict,
         *,
@@ -118,7 +118,7 @@ def _apply_backup(path: list[tuple[MCTSNode, str]], v_leaf_stm: float) -> None:
 
 def mcts_select_move_iccs(
     root_state: XqwlGameState,
-    model: JointPolicyValueNet,
+    model: PolicyValueBackbone,
     device: Any,
     flist: dict,
     *,

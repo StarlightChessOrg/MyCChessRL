@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from mycchess_rl.chess.features import encode_model_planes
 from mycchess_rl.chess.rationale import STM_VALUE_TERMINAL_DRAW, STM_VALUE_TERMINAL_LOSS
-from mycchess_rl.model import JointPolicyValueNet, policy_temperature_scalar
+from mycchess_rl.model import PolicyValueBackbone, policy_temperature_scalar
 from mycchess_rl.xqwl_state import XqwlGameState
 
 
@@ -92,7 +92,7 @@ def _encode_state_current_nchw(state: XqwlGameState, flist: dict[str, list[str]]
 @torch.no_grad()
 def infer_joint_policy_prior_and_value(
     state: XqwlGameState,
-    model: JointPolicyValueNet,
+    model: PolicyValueBackbone,
     device: torch.device,
     flist: dict[str, list[str]],
     *,
@@ -130,7 +130,7 @@ def infer_joint_policy_prior_and_value(
 @torch.no_grad()
 def infer_greedy_move_string(
     state: XqwlGameState,
-    model: JointPolicyValueNet,
+    model: PolicyValueBackbone,
     device: torch.device,
     flist: dict[str, list[str]],
 ) -> str:
@@ -154,7 +154,7 @@ def infer_greedy_move_string(
 @torch.no_grad()
 def eval_value_stm(
     state: XqwlGameState,
-    model: JointPolicyValueNet,
+    model: PolicyValueBackbone,
     device: torch.device,
     flist: dict[str, list[str]],
 ) -> float:
@@ -208,7 +208,7 @@ def batched_encode_roots(
 @torch.no_grad()
 def batched_sample_moves_masked(
     states: list[XqwlGameState],
-    model: JointPolicyValueNet,
+    model: PolicyValueBackbone,
     device: torch.device,
     flist: dict[str, list[str]],
     *,
@@ -276,7 +276,7 @@ def batched_joint_logprob_on_moves(
     obs_list: list[XqwlGameState],
     mv_list: list[str],
     feat_b: torch.Tensor,
-    model: JointPolicyValueNet,
+    model: PolicyValueBackbone,
     device: torch.device,
     *,
     policy_temperature: float = 1.0,
@@ -304,7 +304,7 @@ def batched_joint_logprob_on_moves(
 @torch.no_grad()
 def batched_value_expectation(
     states: list[XqwlGameState],
-    model: JointPolicyValueNet,
+    model: PolicyValueBackbone,
     device: torch.device,
     flist: dict[str, list[str]],
     *,

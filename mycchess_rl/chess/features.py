@@ -68,7 +68,14 @@ def encode_model_planes(
     move_index: int | None = None,
     feature_list: Mapping[str, list[str]] | None = None,
 ) -> np.ndarray:
-    """icyElephant 风格 14 路根特征；其余参数仅为 API 兼容保留。"""
+    """icyElephant 风格 **14 路棋子平面**（行棋方子类在前 + 黑方时纵向翻转）。
+
+    注意：``legal_iccs`` / ``in_check`` / ``last_move`` / ``move_index`` 当前**不参与编码**
+    （仅为调用方 API 兼容而保留）。因此任意「子力与行棋方相同」的局面在 trunk 前完全同像，
+    即使棋理不同（上一着、将军态、重复图、可走子集合不同），网络也**无法区分**，
+    易出现「形似常见面、着法像谱着、实则无理」的捷径解。若需棋理，应扩展 ``in_channels``
+    并在此处拼接历史/应将/合法落点掩码等平面（参见仓库 ``RL_INVESTIGATION.md``）。
+    """
     _ = (legal_iccs, in_check, last_move, move_index)
     fl = FEATURE_LIST if feature_list is None else feature_list
     picker_u8 = encode_picker_planes(boardarr, red_to_move, fl)
