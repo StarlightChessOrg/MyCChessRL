@@ -1,6 +1,7 @@
 # 运行时（与 pyproject.toml 对齐；可用 pip install -r requirements.txt）
 numpy>=1.24
 torch>=2.1
+xmltodict>=0.13
 
 # 网页对弈
 sanic>=23.12

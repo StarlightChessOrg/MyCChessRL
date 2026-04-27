@@ -1,17 +1,12 @@
-"""icyElephant / MyElephant 风格 XML ``.cbf`` → ``xqwl_core`` 回放，供联合策略头监督学习。"""
+"""icyElephant / MyElephant 风格：``xmltodict`` 读 ``.cbf``，主进程无限打乱 + ``xqwl_core`` 回放（与 ``train_policy_torch`` 数据流一致，无 DataLoader）。"""
 from __future__ import annotations
 
-import math
-import os
 import random
-import sys
 from pathlib import Path
 from typing import Any, Iterator
-from xml.etree import ElementTree as ET
 
 import numpy as np
-import torch
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+import xmltodict
 
 from mycchess_rl.chess.rationale import (
     POLICY_MAX_LEGAL_MOVES,
@@ -26,8 +21,6 @@ from mycchess_rl.chess.rationale import (
 from mycchess_rl.encode_parallel import encode_states_inline
 from mycchess_rl.fen_parse import FULL_INIT_FEN, parse_fen_board
 from mycchess_rl.xqwl_state import XqwlGameState
-
-PolicySources = str | Path | list[str]
 
 
 def discover_cbf_files(root: Path | str, *, recursive: bool = True) -> list[str]:
@@ -74,13 +67,31 @@ def _fen_matches_standard_start(fen: str) -> bool:
     return bool(np.array_equal(b1, b2) and r1 == r2)
 
 
-def _red_outcome_class_from_head(head: Any) -> int:
-    if head is None:
+def _xml_text(node: Any) -> str:
+    if node is None:
+        return ""
+    if isinstance(node, dict):
+        return str(node.get("#text", node.get("@value", ""))).strip()
+    return str(node).strip()
+
+
+def _normalize_move_entries(move_node: Any) -> list[dict[str, Any]]:
+    """与 MyElephant ``xml_samples`` 一致：单条 Move 时 xmltodict 返回 dict。"""
+    if isinstance(move_node, list):
+        return move_node
+    if isinstance(move_node, dict):
+        return [move_node]
+    return []
+
+
+def red_outcome_class_from_head_dict(head: Any) -> int:
+    """与 MyElephant ``red_outcome_class_from_head`` 一致（dict Head）。"""
+    if not isinstance(head, dict):
         return VALUE_LABEL_IGNORE
-    rr = head.find("RecordResult")
-    if rr is None or rr.text is None:
+    rr = head.get("RecordResult")
+    if rr is None:
         return VALUE_LABEL_IGNORE
-    s = str(rr.text).strip()
+    s = _xml_text(rr)
     if not s:
         return VALUE_LABEL_IGNORE
     try:
@@ -96,16 +107,10 @@ def _red_outcome_class_from_head(head: Any) -> int:
     return VALUE_LABEL_IGNORE
 
 
-def _move_values_from_movelist(root: ET.Element) -> list[str]:
-    ml = root.find("MoveList")
-    if ml is None:
-        return []
-    out: list[str] = []
-    for node in ml.findall("Move"):
-        v = node.get("value")
-        if v and v != "00-00":
-            out.append(v)
-    return out
+def _load_cbf_dict(path: str | Path) -> dict[str, Any]:
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    return xmltodict.parse(text)
 
 
 def iter_joint_sl_samples_from_cbf(
@@ -115,28 +120,29 @@ def iter_joint_sl_samples_from_cbf(
 ) -> Iterator[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]]:
     """
     在 **标准起始 FEN** 上逐步回放一局；每步 yield 走子**前**的样本。
-
-    Yields:
-        chw: (C,10,9) float32
-        legal_mask: (policy_max_legal,) bool，前 L 格为 True
-        action_idx: 棋谱着法在 ``sorted(legal)`` 中的下标
-        value_sign: -1 / 0 / +1，终局未知时为 0 且 has_value=False
-        has_value: 是否参与价值 MSE
+    解析路径与 MyElephant ``convert_game`` / icyElephant 棋谱结构一致（``xmltodict``）。
     """
-    tree = ET.parse(str(path))
-    root = tree.getroot()
-    head = root.find("Head")
-    if head is None:
-        del tree
+    try:
+        doc = _load_cbf_dict(path)
+    except Exception:
         return
-    fen_el = head.find("FEN")
-    fen = (fen_el.text or "").strip() if fen_el is not None else ""
+    rec = doc.get("ChineseChessRecord")
+    if not isinstance(rec, dict):
+        return
+    head = rec.get("Head")
+    if not isinstance(head, dict):
+        return
+    fen = _xml_text(head.get("FEN"))
     if not _fen_matches_standard_start(fen):
-        del tree
         return
-    red_cls = _red_outcome_class_from_head(head)
-    moves = _move_values_from_movelist(root)
-    del tree, root
+    red_cls = red_outcome_class_from_head_dict(head)
+    ml = rec.get("MoveList") or {}
+    moves_raw = ml.get("Move")
+    moves = [
+        str(m["@value"])
+        for m in _normalize_move_entries(moves_raw)
+        if m.get("@value") not in (None, "00-00")
+    ]
     st = XqwlGameState()
     st.reset()
     for mv in moves:
@@ -152,7 +158,6 @@ def iter_joint_sl_samples_from_cbf(
         mask = np.zeros((policy_max_legal,), dtype=np.bool_)
         mask[: len(legs)] = True
         idx = int(legs.index(mv))
-        # 独立拷贝，避免与编码/下一局缓冲区共享底层存储导致未定义行为或堆损坏
         chw = np.array(encode_states_inline([st])[0], dtype=np.float32, copy=True)
         stm_cls = int(stm_outcome_class_from_red_outcome(red_cls, bool(st.red_to_move)))
         if stm_cls == VALUE_LABEL_IGNORE:
@@ -170,32 +175,31 @@ def iter_joint_sl_samples_from_cbf(
         st.make_move_iccs(mv)
 
 
-def _shard_filelist_for_worker(filelist: list[str]) -> list[str]:
-    wi = get_worker_info()
-    paths = list(filelist)
-    if not paths:
-        return paths
-    if wi is None:
-        return paths
-    n = len(paths)
-    per = int(math.ceil(n / float(wi.num_workers)))
-    start = wi.id * per
-    end = min(start + per, n)
-    if start < end:
-        return paths[start:end]
-    sub = [paths[i] for i in range(wi.id, n, wi.num_workers)]
-    return sub if sub else paths
-
-
-def _dataloader_worker_init(_worker_id: int) -> None:
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-    try:
-        torch.set_num_threads(1)
-    except Exception:
-        pass
+def infinite_shuffled_joint_samples(
+    filelist: list[str],
+    *,
+    policy_max_legal: int = POLICY_MAX_LEGAL_MOVES,
+    rng: random.Random | None = None,
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]]:
+    """与 MyElephant ``SuccessorPolicyIterableDataset`` 同构：无限打乱文件列表后逐局 yield 样本（主进程，无 DataLoader）。"""
+    rnd = rng if rng is not None else random.Random()
+    fl = [str(x) for x in filelist]
+    if not fl:
+        raise ValueError("棋谱文件列表为空")
+    while True:
+        rnd.shuffle(fl)
+        yielded_round = False
+        for path in fl:
+            try:
+                for sample in iter_joint_sl_samples_from_cbf(path, policy_max_legal=policy_max_legal):
+                    yielded_round = True
+                    yield sample
+            except Exception:
+                continue
+        if not yielded_round:
+            raise RuntimeError(
+                "整轮打乱后未产生任何训练样本：请确认 .cbf 为 icy 格式且 Head/FEN 与标准开局一致（当前 xqwl 无法 set_fen）"
+            )
 
 
 def collate_joint_sl_batch(
@@ -209,90 +213,12 @@ def collate_joint_sl_batch(
     return x, m, yi, vs, hv
 
 
-class JointCBFIterableDataset(IterableDataset):
-    """无限打乱遍历棋谱；每 worker 分片文件列表。"""
-
-    def __init__(self, sources: PolicySources, *, policy_max_legal: int) -> None:
-        super().__init__()
-        if isinstance(sources, list):
-            self.filelist = [str(x) for x in sources]
-        else:
-            p = Path(sources)
-            lines = p.read_text(encoding="utf-8").splitlines()
-            self.filelist = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
-        if not self.filelist:
-            raise ValueError("棋谱清单为空")
-        self.policy_max_legal = int(policy_max_legal)
-
-    def __iter__(self) -> Any:
-        my_files = _shard_filelist_for_worker(self.filelist)
-        while True:
-            rnd = random.Random()
-            rnd.shuffle(my_files)
-            for path in my_files:
-                try:
-                    for sample in iter_joint_sl_samples_from_cbf(
-                        path, policy_max_legal=self.policy_max_legal
-                    ):
-                        yield sample
-                except Exception:
-                    continue
-
-
-def make_joint_sl_dataloader(
-    sources: PolicySources,
+def next_collated_batch(
+    gen: Iterator[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]],
     batch_size: int,
-    *,
-    policy_max_legal: int = POLICY_MAX_LEGAL_MOVES,
-    num_workers: int = 0,
-    pin_memory: bool = False,
-    prefetch_factor: int = 2,
-    drop_last: bool = True,
-) -> DataLoader:
-    ds = JointCBFIterableDataset(sources, policy_max_legal=policy_max_legal)
-    kw: dict[str, Any] = {
-        "dataset": ds,
-        "batch_size": batch_size,
-        "num_workers": num_workers,
-        "collate_fn": collate_joint_sl_batch,
-        "pin_memory": pin_memory,
-        "drop_last": drop_last,
-    }
-    if num_workers > 0:
-        kw["persistent_workers"] = True
-        kw["prefetch_factor"] = max(2, int(prefetch_factor))
-        kw["worker_init_fn"] = _dataloader_worker_init
-        if sys.platform == "win32":
-            kw["multiprocessing_context"] = "spawn"
-    return DataLoader(**kw)
-
-
-def build_joint_sl_train_val_loaders(
-    train_sources: PolicySources,
-    val_sources: PolicySources,
-    batch_size: int,
-    *,
-    policy_max_legal: int = POLICY_MAX_LEGAL_MOVES,
-    num_workers: int = 0,
-    prefetch_factor: int = 2,
-    pin_memory: bool = False,
-) -> tuple[DataLoader, DataLoader]:
-    train_loader = make_joint_sl_dataloader(
-        train_sources,
-        batch_size,
-        policy_max_legal=policy_max_legal,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        drop_last=True,
-    )
-    val_loader = make_joint_sl_dataloader(
-        val_sources,
-        batch_size,
-        policy_max_legal=policy_max_legal,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        drop_last=False,
-    )
-    return train_loader, val_loader
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """从生成器凑满 ``batch_size`` 条后 ``collate``（主线程，无 DataLoader）。"""
+    buf: list[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]] = []
+    while len(buf) < batch_size:
+        buf.append(next(gen))
+    return collate_joint_sl_batch(buf)

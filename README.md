@@ -5,7 +5,7 @@
 ## 依赖
 
 - **Python**：≥ 3.10  
-- **NumPy、PyTorch**：见 `requirements.txt` 或与 `pyproject.toml` 同步。  
+- **NumPy、PyTorch、xmltodict**：见 `requirements.txt` 或与 `pyproject.toml` 同步（监督学习与 icyElephant/MyElephant 棋谱解析一致）。  
 - **`xqwl_core`**：C++17 扩展（pybind11），**必须**自行编译并加入 `PYTHONPATH` 或安装到当前环境。训练、并行环境与对弈等入口在导入 `mycchess_rl.xqwl_state` 时需要该模块；仅使用 `mycchess_rl.chess` 等纯 NumPy 子模块可不装。  
 - **网页对弈**：`sanic`（`pip install -r requirements.txt` 或 `pip install -e ".[play]"`）。
 
@@ -68,7 +68,7 @@ python -m mycchess_rl.train_sl --cbf-manifest my_cbfs.txt --epochs 2 --n-batch-t
 
 **`--epochs`**：本轮再跑多少个 epoch（续 SL 时在已完成的 epoch 之后追加）。
 
-默认 ``--num-workers 0``（避免部分环境下子进程与 ``xqwl_core`` 交互问题）；显存允许时可增大 ``--batch-size``。监督训练在 ``save-dir`` 下写 **`best.pt`** / **`last.pt`**（与 YOLO 命名一致；验证 loss 更优时更新 ``best.pt``），字段与 ``play_web`` / PPO 的 ``model`` 块兼容。
+监督学习在 **主进程** 内用与 MyElephant 相同的 **``xmltodict`` + 无限打乱棋谱流** 组 batch（**不使用 DataLoader**），避免多进程/预取与本地扩展交互引发的崩溃。显存允许时可增大 ``--batch-size``。产出 ``save-dir`` 下的 ``best.pt`` / ``last.pt``（验证 loss 更优时更新 ``best.pt``），字段与 ``play_web`` / PPO 的 ``model`` 块兼容。
 
 ``train_ppo`` 会按轮打印 **rollout / 优化耗时、样本数、GAE 统计、分项损失、熵、importance ratio、clip 比例、近似 KL、梯度范数、CUDA 显存** 等；`--log-every N` 为每 N 轮打一次，`--log-file` 同步写入文件。`--rollout-log-every`（默认 32）在单轮 rollout 内输出进度，避免首轮长时间无输出。
 

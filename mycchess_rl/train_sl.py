@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import gc
 import logging
+import random
 import sys
 import time
 from pathlib import Path
@@ -17,8 +18,9 @@ import torch.nn.functional as F
 
 from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play, torch_load_checkpoint
 from mycchess_rl.sl_data import (
-    build_joint_sl_train_val_loaders,
     discover_cbf_files,
+    infinite_shuffled_joint_samples,
+    next_collated_batch,
     split_paths_train_test,
 )
 
@@ -112,7 +114,7 @@ def main() -> None:
         default=3,
         help="本轮要跑的 epoch 数（续训时在已完成的 epoch 之后再跑这么多个）",
     )
-    p.add_argument("--n-batch-train", type=int, default=200, help="每 epoch 训练批次数（Iterable 无限）")
+    p.add_argument("--n-batch-train", type=int, default=200, help="每 epoch 训练批次数（主进程从打乱棋谱流中组 batch）")
     p.add_argument("--n-batch-val", type=int, default=30, help="每 epoch 验证批次数")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
@@ -125,8 +127,6 @@ def main() -> None:
         help="已有 .pt：加载权重；若为 SL 训练保存（含 epoch 字段）则同时恢复 AdamW 与进度。省略则在 --save-dir 下自动创建 bootstrap.pt 再开训",
     )
     p.add_argument("--save-dir", type=Path, default=Path("runs"))
-    p.add_argument("--num-workers", type=int, default=0, help="DataLoader worker；Windows 或 xqwl 多进程建议 0")
-    p.add_argument("--prefetch-factor", type=int, default=2)
     p.add_argument("--log-file", type=Path, default=None)
     args = p.parse_args()
 
@@ -166,8 +166,8 @@ def main() -> None:
         raise SystemExit(2)
 
     _LOG.info(
-        "训练吞吐说明: 每 epoch 跑 --n-batch-train=%d 批 × --batch-size=%d 条样本（Iterable 无限循环）；"
-        "日志里的 train/val 是「棋谱文件个数」，不是每 epoch 步数。仅 Head/FEN 与标准开局一致 的 .cbf 才会产生样本，其余对局整盘跳过。",
+        "训练吞吐说明: 每 epoch --n-batch-train=%d 批 × --batch-size=%d 条（与 MyElephant 相同主进程打乱流，无 DataLoader）；"
+        "train/val 为棋谱文件个数；仅标准开局 FEN 的 .cbf 产生样本。",
         int(args.n_batch_train),
         int(args.batch_size),
     )
@@ -220,19 +220,12 @@ def main() -> None:
     for g in opt.param_groups:
         g["lr"] = float(args.lr)
     pm = model.policy_max_legal
-    # Iterable + from_numpy：不用 DataLoader pin_memory，避免 PyTorch 对 pin_memory_device 的弃用警告及潜在 pinned 堆问题
-    train_loader, val_loader = build_joint_sl_train_val_loaders(
-        train_files,
-        val_files,
-        int(args.batch_size),
-        policy_max_legal=pm,
-        num_workers=int(args.num_workers),
-        prefetch_factor=int(args.prefetch_factor),
-        pin_memory=False,
+    train_rng = random.Random(int(args.data_seed))
+    val_rng = random.Random(int(args.data_seed) + 1_000_003)
+    train_gen = infinite_shuffled_joint_samples(
+        train_files, policy_max_legal=pm, rng=train_rng
     )
-
-    train_it = iter(train_loader)
-    val_it = iter(val_loader)
+    val_gen = infinite_shuffled_joint_samples(val_files, policy_max_legal=pm, rng=val_rng)
     t0 = time.perf_counter()
 
     for k in range(int(args.epochs)):
@@ -241,11 +234,9 @@ def main() -> None:
         exp_acc = _ExpVal()
         model.train()
         for bi in range(int(args.n_batch_train)):
-            try:
-                x_np, m_np, yi_np, vs_np, hv_np = next(train_it)
-            except StopIteration:
-                train_it = iter(train_loader)
-                x_np, m_np, yi_np, vs_np, hv_np = next(train_it)
+            x_np, m_np, yi_np, vs_np, hv_np = next_collated_batch(
+                train_gen, int(args.batch_size)
+            )
 
             x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device)
             mask = torch.from_numpy(np.ascontiguousarray(m_np)).to(device)
@@ -295,11 +286,9 @@ def main() -> None:
         v_accs: list[float] = []
         with torch.no_grad():
             for _ in range(int(args.n_batch_val)):
-                try:
-                    x_np, m_np, yi_np, vs_np, hv_np = next(val_it)
-                except StopIteration:
-                    val_it = iter(val_loader)
-                    x_np, m_np, yi_np, vs_np, hv_np = next(val_it)
+                x_np, m_np, yi_np, vs_np, hv_np = next_collated_batch(
+                    val_gen, int(args.batch_size)
+                )
                 x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device)
                 mask = torch.from_numpy(np.ascontiguousarray(m_np)).to(device)
                 tgt = torch.from_numpy(np.ascontiguousarray(yi_np.astype(np.int64))).to(device)
