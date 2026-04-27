@@ -11,8 +11,8 @@ import torch.nn.functional as F
 from mycchess_rl.chess.rationale import POLICY_MAX_LEGAL_MOVES, POLICY_SELECT_IN_CHANNELS
 from mycchess_rl.hierarchical_sl import HIER_PIECE_HEAD_DIM, HIER_SQUARE_HEAD_DIM
 
-# 每元组：(1×1, 1×1→3×3 降维, 3×3, 1×1→3×3→3×3 两段降维/中间/输出, 池化后 1×1)
-# 两支 3×3 串联为 v3 「最新常用」因子分解形式；浅塔仅 2 个 Inception 模块 + 宽 stem。
+# 每元组：(1×1, 1×1→空间 降维, 空间支输出宽, 1×1→空间→空间 的降维/中间/末宽, 池化后 1×1)
+# 空间支路用 1×3 再接 3×1 代替 3×3（Inception v2/v3 非对称分解）；浅塔 2 个 Inception 模块 + 宽 stem。
 DEFAULT_INCEPTION_SPECS: tuple[tuple[int, int, int, int, int, int, int], ...] = (
     (96, 64, 128, 64, 96, 128, 64),
     (128, 96, 192, 96, 128, 192, 96),
@@ -26,8 +26,30 @@ def _conv_bn(in_ch: int, out_ch: int, k: int, *, padding: int = 0) -> nn.Sequent
     )
 
 
+def _conv_bn_hw(
+    in_ch: int,
+    out_ch: int,
+    kernel: tuple[int, int],
+    padding: tuple[int, int],
+) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, kernel_size=kernel, padding=padding, bias=False),
+        nn.BatchNorm2d(out_ch),
+    )
+
+
+def _factorized_3x3(in_ch: int, out_ch: int) -> nn.Sequential:
+    """单步 3×3 感受野的 1×3 + 3×1 分解（padding 保持 H、W 不变）。"""
+    return nn.Sequential(
+        _conv_bn_hw(in_ch, out_ch, (1, 3), (0, 1)),
+        nn.ELU(inplace=True),
+        _conv_bn_hw(out_ch, out_ch, (3, 1), (1, 0)),
+        nn.ELU(inplace=True),
+    )
+
+
 class InceptionModule(nn.Module):
-    """四支并行：1×1；1×1→3×3；1×1→3×3→3×3；AvgPool3×3→1×1（空间尺寸不变）。"""
+    """四支并行：1×1；1×1→1×3→3×1；1×1→(1×3→3×1)×2；AvgPool3×3→1×1（空间尺寸不变）。"""
 
     def __init__(
         self,
@@ -45,16 +67,13 @@ class InceptionModule(nn.Module):
         self.b2 = nn.Sequential(
             _conv_bn(in_channels, ch3x3reduce, 1),
             nn.ELU(inplace=True),
-            _conv_bn(ch3x3reduce, ch3x3, 3, padding=1),
-            nn.ELU(inplace=True),
+            _factorized_3x3(ch3x3reduce, ch3x3),
         )
         self.b3 = nn.Sequential(
             _conv_bn(in_channels, ch3x3dbl_reduce, 1),
             nn.ELU(inplace=True),
-            _conv_bn(ch3x3dbl_reduce, ch3x3dbl_1, 3, padding=1),
-            nn.ELU(inplace=True),
-            _conv_bn(ch3x3dbl_1, ch3x3dbl_2, 3, padding=1),
-            nn.ELU(inplace=True),
+            _factorized_3x3(ch3x3dbl_reduce, ch3x3dbl_1),
+            _factorized_3x3(ch3x3dbl_1, ch3x3dbl_2),
         )
         self.b4 = nn.Sequential(
             nn.AvgPool2d(3, stride=1, padding=1),
