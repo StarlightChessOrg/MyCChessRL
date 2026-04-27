@@ -121,6 +121,11 @@ def policy_value_loss_step(
     n = int(obs.shape[0])
     if n == 0:
         return 0.0, {"batch": 0.0}
+    if str(getattr(model, "policy_kind", "joint")).lower() == "hierarchical":
+        raise RuntimeError(
+            "PPO 仅支持联合策略（policy_kind=joint）checkpoint；"
+            "层次化权重请使用 train_sl，或扩展 ppo.policy_value_loss_step。"
+        )
 
     mbs = n if mini_batch_size is None else max(1, int(mini_batch_size))
     if mbs >= n:

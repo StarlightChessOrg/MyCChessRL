@@ -188,7 +188,7 @@ class InceptionHierarchicalPolicyValueNet(nn.Module):
         self.in_channels = c
         self.stem_channels = int(stem_channels)
         self.inception_specs = tuple(tuple(int(x) for x in row) for row in sp)
-        self.policy_max_legal = 0
+        self.policy_max_legal = int(POLICY_MAX_LEGAL_MOVES)
         self.value_scale = float(value_scale)
         self.backbone = InceptionPolicyBackbone(c, self.stem_channels, self.inception_specs)
         d = self.backbone.out_dim

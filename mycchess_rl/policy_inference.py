@@ -9,8 +9,13 @@ import torch.nn.functional as F
 
 from mycchess_rl.chess.features import encode_model_planes
 from mycchess_rl.chess.rationale import STM_VALUE_TERMINAL_DRAW, STM_VALUE_TERMINAL_LOSS
+from mycchess_rl.hierarchical_sl import hierarchical_legal_move_logits
 from mycchess_rl.model import PolicyValueBackbone, policy_temperature_scalar, trunk_policy_value_feats
 from mycchess_rl.xqwl_state import XqwlGameState
+
+
+def _policy_is_hierarchical(model: object) -> bool:
+    return str(getattr(model, "policy_kind", "joint")).lower() == "hierarchical"
 
 
 def sorted_legal_iccs(state: XqwlGameState) -> list[str]:
@@ -111,11 +116,18 @@ def infer_joint_policy_prior_and_value(
     x_cur = _encode_state_current_nchw(state, flist, device)
     model.eval()
     T = policy_temperature_scalar(policy_temperature)
-    logits_m, v = model(x_cur)
-    mask = torch.zeros(1, M, dtype=torch.bool, device=device)
-    mask[0, : len(legs)] = True
-    scaled = (logits_m / T).masked_fill(~mask, -1e9)
-    p = torch.softmax(scaled, dim=1)[0, : len(legs)].detach().float().cpu().numpy()
+    if _policy_is_hierarchical(model):
+        lt, lf, lto, v = model(x_cur)
+        vec = hierarchical_legal_move_logits(state, lt, lf, lto, legs)
+        scaled = vec / T
+        scaled = scaled - scaled.max()
+        p = torch.softmax(scaled, dim=0).detach().float().cpu().numpy()
+    else:
+        logits_m, v = model(x_cur)
+        mask = torch.zeros(1, M, dtype=torch.bool, device=device)
+        mask[0, : len(legs)] = True
+        scaled = (logits_m / T).masked_fill(~mask, -1e9)
+        p = torch.softmax(scaled, dim=1)[0, : len(legs)].detach().float().cpu().numpy()
     s = float(p.sum())
     if s > 0:
         p = p / s
@@ -142,8 +154,13 @@ def infer_greedy_move_string(
         raise RuntimeError(f"合法着法数 {len(legs)} > policy_max_legal={M}")
     x_cur = _encode_state_current_nchw(state, flist, device)
     model.eval()
-    logits_m, _ = model(x_cur)
     T = policy_temperature_scalar(1.0)
+    if _policy_is_hierarchical(model):
+        lt, lf, lto, _ = model(x_cur)
+        vec = hierarchical_legal_move_logits(state, lt, lf, lto, legs)
+        k = int(torch.argmax(vec / T, dim=0).item())
+        return legs[k]
+    logits_m, _ = model(x_cur)
     mask = torch.zeros(1, M, dtype=torch.bool, device=device)
     mask[0, : len(legs)] = True
     scaled = (logits_m / T).masked_fill(~mask, -1e9)
@@ -165,7 +182,8 @@ def eval_value_stm(
         return float(STM_VALUE_TERMINAL_DRAW)
     x_cur = _encode_state_current_nchw(state, flist, device)
     model.eval()
-    _, v = model(x_cur)
+    out = model(x_cur)
+    v = out[-1] if _policy_is_hierarchical(model) else out[1]
     return float(v.item())
 
 
@@ -239,27 +257,45 @@ def batched_sample_moves_masked(
             encode_workers=encode_workers,
             encode_backend=encode_backend,
         )
-    pol_b, val_b = trunk_policy_value_feats(model, xb)
-    logits_m, _ = model.forward_heads_from_feat(pol_b, value_feat=val_b)
-    scaled = logits_m / T
+    if _policy_is_hierarchical(model):
+        lt, lf, lto, _ = model(xb)
+        idx = torch.zeros(B, dtype=torch.long, device=device)
+        for bi in range(B):
+            if not has_legal_list[bi]:
+                continue
+            ls = legals_str[bi]
+            L = len(ls)
+            if L > M:
+                raise RuntimeError(
+                    f"环境 {bi} 合法着法数 {L} 超过 policy_max_legal={M}"
+                )
+            vec = hierarchical_legal_move_logits(states[bi], lt[bi : bi + 1], lf[bi : bi + 1], lto[bi : bi + 1], ls)
+            srow = vec / T
+            srow = srow - srow.max()
+            p_row = torch.softmax(srow, dim=0)
+            idx[bi] = torch.multinomial(p_row, 1, generator=generator).squeeze(0)
+    else:
+        pol_b, val_b = trunk_policy_value_feats(model, xb)
+        logits_m, _ = model.forward_heads_from_feat(pol_b, value_feat=val_b)
+        scaled = logits_m / T
 
-    mask = torch.zeros(B, M, dtype=torch.bool, device=device)
-    for bi, ls in enumerate(legals_str):
-        L = len(ls)
-        if L == 0:
-            continue
-        if L > M:
-            raise RuntimeError(
-                f"环境 {bi} 合法着法数 {L} 超过 policy_max_legal={M}"
-            )
-        mask[bi, :L] = True
+        mask = torch.zeros(B, M, dtype=torch.bool, device=device)
+        for bi, ls in enumerate(legals_str):
+            L = len(ls)
+            if L == 0:
+                continue
+            if L > M:
+                raise RuntimeError(
+                    f"环境 {bi} 合法着法数 {L} 超过 policy_max_legal={M}"
+                )
+            mask[bi, :L] = True
 
-    logits_m = scaled.masked_fill(~mask, -1e9)
-    safe = torch.full_like(logits_m, -1e9)
-    safe[:, 0] = 0.0
-    logits_m = torch.where(has_legal.unsqueeze(1), logits_m, safe)
-    p = torch.softmax(logits_m, dim=1)
-    idx = torch.multinomial(p, 1, generator=generator).squeeze(1)
+        logits_m = scaled.masked_fill(~mask, -1e9)
+        safe = torch.full_like(logits_m, -1e9)
+        safe[:, 0] = 0.0
+        logits_m = torch.where(has_legal.unsqueeze(1), logits_m, safe)
+        p = torch.softmax(logits_m, dim=1)
+        idx = torch.multinomial(p, 1, generator=generator).squeeze(1)
 
     out_moves: list[str] = []
     for bi in range(B):
@@ -294,6 +330,20 @@ def batched_joint_logprob_on_moves(
     mask, action_idx = joint_legal_mask_and_action_index(
         obs_list, mv_list, device, model.policy_max_legal
     )
+    if _policy_is_hierarchical(model):
+        lt = model.policy_head_type(feat_b)
+        lf = model.policy_head_from(feat_b)
+        lto = model.policy_head_to(feat_b)
+        log_p = torch.empty(B, device=device, dtype=torch.float32)
+        for i in range(B):
+            legs = sorted_legal_iccs(obs_list[i])
+            vec = hierarchical_legal_move_logits(obs_list[i], lt[i : i + 1], lf[i : i + 1], lto[i : i + 1], legs)
+            srow = vec / T
+            srow = srow - srow.max()
+            log_p_all = F.log_softmax(srow, dim=0)
+            k = int(action_idx[i].item())
+            log_p[i] = log_p_all[k]
+        return log_p, mask, action_idx
     logits_m, _ = (
         model.forward_heads_from_feat(feat_b, value_feat=value_feat)
         if value_feat is not None
@@ -346,8 +396,11 @@ def batched_value_expectation(
                 encode_workers=encode_workers,
                 encode_backend=encode_backend,
             )
-        pol_b, val_b = trunk_policy_value_feats(model, xb)
-        _, vals = model.forward_heads_from_feat(pol_b, value_feat=val_b)
+        if _policy_is_hierarchical(model):
+            _, _, _, vals = model(xb)
+        else:
+            pol_b, val_b = trunk_policy_value_feats(model, xb)
+            _, vals = model.forward_heads_from_feat(pol_b, value_feat=val_b)
         for j, idx in enumerate(active):
             out[idx] = vals[j]
     return out

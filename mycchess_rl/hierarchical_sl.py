@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import torch
 
 from mycchess_rl.iccs_util import iccs_y_to_board_view_row, parse_move_squares
 from mycchess_rl.piece_types import ChessSide, PieceT, fench_to_species
@@ -29,6 +30,39 @@ def piece_t_to_head_index(pt: PieceT) -> int:
 def square_iccs_to_index(y_iccs: int, x: int) -> int:
     """ICCS 引擎 (y,x) → ``board_view`` 行主序展平下标 0..89。"""
     return iccs_y_to_board_view_row(y_iccs) * 9 + int(x)
+
+
+def hierarchical_legal_move_logits(
+    st: Any,
+    lt: torch.Tensor,
+    lf: torch.Tensor,
+    lto: torch.Tensor,
+    legs: list[str],
+) -> torch.Tensor:
+    """
+    对 ``legs`` 中每条 ICCS 着法，取与 SL 一致的三头下标，将子种/源/目三份 logit 相加
+    得到该着法的标量 logit（再在调用方做温度与 softmax）。
+    """
+    device = lt.device
+    dtype = lt.dtype
+
+    def _row(t: torch.Tensor) -> torch.Tensor:
+        if t.dim() == 2:
+            return t[0]
+        if t.dim() == 1:
+            return t
+        raise ValueError(f"hierarchical logits: unexpected tensor rank {t.dim()}")
+
+    lt0, lf0, lto0 = _row(lt), _row(lf), _row(lto)
+    L = len(legs)
+    out = torch.full((L,), -1e9, device=device, dtype=dtype)
+    for i, mv in enumerate(legs):
+        dec = build_hierarchical_sl_labels(st, mv)
+        if dec is None:
+            continue
+        _, tt, _, tf, _, t2 = dec
+        out[i] = lt0[int(tt)] + lf0[int(tf)] + lto0[int(t2)]
+    return out
 
 
 def build_hierarchical_sl_labels(
