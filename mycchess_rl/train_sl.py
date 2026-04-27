@@ -371,7 +371,14 @@ def main() -> None:
                 acc = float((pred == tgt).float().mean().item())
             exp_loss.update(float(loss.item()))
             exp_acc.update(acc * 100.0)
-            pbar_tr.set_postfix(loss=f"{float(loss.item()):.4f}", acc=f"{acc * 100.0:.2f}%", step=global_step)
+            el_b = exp_loss.get()
+            ea_b = exp_acc.get()
+            pbar_tr.set_postfix(
+                ema_loss=f"{el_b:.4f}" if el_b is not None else f"{float(loss.item()):.4f}",
+                ema_acc=f"{ea_b:.2f}%" if ea_b is not None else f"{acc * 100.0:.2f}%",
+                batch=f"{float(loss.item()):.3f}/{acc * 100.0:.1f}%",
+                step=global_step,
+            )
 
         el = exp_loss.get()
         ea = exp_acc.get()
@@ -381,6 +388,8 @@ def main() -> None:
         model.eval()
         v_losses: list[float] = []
         v_accs: list[float] = []
+        val_ema_loss = _ExpVal()
+        val_ema_acc = _ExpVal()
         with torch.no_grad():
             if n_val_batches <= 0:
                 val_iter = iter(())
@@ -410,9 +419,19 @@ def main() -> None:
                     loss_v = torch.zeros((), device=device)
                 loss = loss_p + float(args.value_loss_weight) * loss_v
                 pred = logits_masked.argmax(dim=-1)
-                v_losses.append(float(loss.item()))
-                v_accs.append(float((pred == tgt).float().mean().item() * 100.0))
-                pbar_va.set_postfix(loss=f"{float(loss.item()):.4f}", acc=f"{(pred == tgt).float().mean().item() * 100.0:.2f}%")
+                v_b = float(loss.item())
+                a_b = float((pred == tgt).float().mean().item() * 100.0)
+                v_losses.append(v_b)
+                v_accs.append(a_b)
+                val_ema_loss.update(v_b)
+                val_ema_acc.update(a_b)
+                vl_e = val_ema_loss.get()
+                va_e = val_ema_acc.get()
+                pbar_va.set_postfix(
+                    ema_loss=f"{vl_e:.4f}" if vl_e is not None else f"{v_b:.4f}",
+                    ema_acc=f"{va_e:.2f}%" if va_e is not None else f"{a_b:.2f}%",
+                    batch=f"{v_b:.3f}/{a_b:.1f}%",
+                )
 
         if v_losses:
             val_m = float(np.mean(v_losses))
