@@ -122,11 +122,14 @@ def collect_rollout_step(
     rollout_pipeline_groups: int = 1,
     reward_shaping_capture: float = 0.0,
     reward_shaping_king: float = 0.0,
+    random_action_prob: float = 0.0,
+    explore_rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[XqwlGameState], list[str]]:
     """非终局塑形仅两项（**0 关闭**）：压对方将/帅、吃子（按子种加权）。
 
     - ``reward_shaping_king``：落点与对方将/帅的接近度 ``prox∈[0,1]`` 线性奖励；若走后对方应将，再加 ``×(0.4+0.6·prox)``。
     - ``reward_shaping_capture``：吃子时 ``基量 × 子种权重``（兵卒=1，象士、马、炮、车、将递增，见 ``_CAPTURE_MULT``）。
+    - ``random_action_prob``：每环境每步以该概率用 **均匀随机合法 ICCS** 替换策略样本（需 ``explore_rng``）；利于离开开局记忆、覆盖乱战。
     """
     n = vec.n_env
     rewards = np.zeros(n, dtype=np.float32)
@@ -149,6 +152,19 @@ def collect_rollout_step(
     )
     for j, i in enumerate(active):
         moves_out[i] = sampled[j]
+
+    p_rand = float(random_action_prob)
+    if p_rand > 0.0 and explore_rng is not None:
+        p_rand = min(1.0, max(0.0, p_rand))
+        for i in active:
+            if explore_rng.random() >= p_rand:
+                continue
+            g = vec.slots[i].game
+            leg = g.legal_moves_iccs_str()
+            if not leg:
+                continue
+            lex = sorted(leg)
+            moves_out[i] = str(explore_rng.choice(lex))
 
     for i in active:
         g = vec.slots[i].game

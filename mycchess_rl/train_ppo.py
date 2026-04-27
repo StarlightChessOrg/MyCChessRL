@@ -118,6 +118,12 @@ def main() -> None:
         help="仅 encode-backend 为 thread/process 时生效；并行 worker 数，省略则 min(8, CPU核数)；1=退化为单 worker",
     )
     p.add_argument(
+        "--random-action-prob",
+        type=float,
+        default=0.1,
+        help="rollout 每步每环境：以该概率用「均匀随机合法着」替代策略采样（0=关闭）；利于乱战与非常规面，略增梯度方差",
+    )
+    p.add_argument(
         "--ppo-mini-batch",
         type=int,
         default=4096,
@@ -269,6 +275,10 @@ def main() -> None:
     T = args.steps
     N = args.n_env
     gen = torch.Generator(device=device)
+    explore_rng = np.random.default_rng()
+    r_ap = float(args.random_action_prob)
+    r_ap = min(1.0, max(0.0, r_ap))
+    _LOG.info("rollout 随机合法着手探索概率 random_action_prob=%.4f", r_ap)
     log_every = max(1, int(args.log_every))
     roll_log = int(args.rollout_log_every)
 
@@ -345,6 +355,8 @@ def main() -> None:
                     rollout_pipeline_groups=rp_groups,
                     reward_shaping_capture=rs_cap,
                     reward_shaping_king=rs_king,
+                    random_action_prob=r_ap,
+                    explore_rng=explore_rng,
                 )
                 act_buf[t, :] = moves
                 rew_buf[t] = rew

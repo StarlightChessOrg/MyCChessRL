@@ -73,7 +73,7 @@ python -m mycchess_rl.train_sl --cbf-manifest my_cbfs.txt --epochs 2 --recount-s
 
 监督学习在 **主进程** 内用 **``xmltodict``** 读棋谱、**不使用 DataLoader**；每 epoch **先扫完整个训练集**（打乱文件顺序、每文件一轮）→ **再扫完整个验证集** → 验证 loss 更优则写 ``best.pt``，且每轮都写 ``last.pt``（YOLO 习惯）。进度用 ``tqdm``；首次会统计 train/val 样本条数（可缓存在 ``save-dir/sl_sample_counts.json``，``--recount-samples`` 强制重算）。显存允许时可增大 ``--batch-size``。字段与 ``play_web`` / PPO 的 ``model`` 块兼容。
 
-``train_ppo`` 会按轮打印 **rollout / 优化耗时、样本数、GAE 统计、分项损失、熵、importance ratio、clip 比例、近似 KL、梯度范数、CUDA 显存** 等；`--log-every N` 为每 N 轮打一次，`--log-file` 同步写入文件。`--rollout-log-every`（默认 32）在单轮 rollout 内输出进度，避免首轮长时间无输出。
+``train_ppo`` 会按轮打印 **rollout / 优化耗时、样本数、GAE 统计、分项损失、熵、importance ratio、clip 比例、近似 KL、梯度范数、CUDA 显存** 等；`--log-every N` 为每 N 轮打一次，`--log-file` 同步写入文件。`--rollout-log-every`（默认 32）在单轮 rollout 内输出进度，避免首轮长时间无输出。**`--random-action-prob`**（默认 **0.1**）：每步以该概率用均匀随机合法着替代策略样本，利于非常规局面；设为 **0** 关闭。
 
 **中途存盘（YOLO 风格）**：在 **`--save-dir`** 下每完成一轮 PPO 更新即覆盖 **`last.pt`**；当本轮 **`loss_total`** 低于历史最佳时额外写入 **`best.pt`**。可选 **`--save-every N`**（默认 50）：非 0 时另在 **`save-dir/weights/upd_000049.pt`** 按全局 ``upd`` 保留快照。训练用 checkpoint 含 **`optimizer`**（Adam）与 **`update`**，**`--resume`** 且未指定 **`--checkpoint`** 时默认读 **`save-dir/last.pt`**；也可 **`--checkpoint save-dir/best.pt`** 续训。仅推理可不设 ``--resume``，只读 ``model`` 等字段。
 
