@@ -89,7 +89,7 @@ class XqwlWebSession:
         self.sel_from: tuple[int, int] | None = None  # board_view 坐标 (ix, iy)
         # 上一着 ICCS 引擎坐标 (x1,y1,x2,y2)，与 ``legal_moves_iccs`` 一致
         self.last_move: tuple[int, int, int, int] | None = None
-        self.strategy_red = STRATEGY_NEURAL
+        self.strategy_red = STRATEGY_HUMAN
         self.strategy_black = STRATEGY_HUMAN
         self._toasts: list[dict[str, str]] = []
         self._ai_busy = False
@@ -322,11 +322,11 @@ def _html_page() -> str:
     <div class="board-wrap"><div class="board-card"><div class="board" id="board"></div></div></div>
     <div class="sidepanel">
       <h1>MyCChessRL 象棋对弈</h1>
-      <div class="subtitle">XQWL 规则核 · Sanic · 纯网络 / MCTS(PUCT+NN)</div>
+      <div class="subtitle">XQWL 规则核 · 开局双方人类 · 棋盘默认红方在下 · 纯网络 / MCTS 可选</div>
       <label>红方策略</label><select id="sel-red"></select>
       <label>黑方策略</label><select id="sel-black"></select>
       <button type="button" id="btn-new">新局</button>
-      <button type="button" class="btn-secondary" id="btn-flip" title="上下翻转棋盘（黑方视角）">翻转棋盘</button>
+      <button type="button" class="btn-secondary" id="btn-flip" title="当前为红方视角（红在下）；点击后黑方在下">翻转棋盘（黑方视角）</button>
       <div id="status"></div>
     </div>
   </div>
@@ -402,7 +402,7 @@ def _html_page() -> str:
   });
   btnFlip.addEventListener("click",function(){
     viewFlipY=!viewFlipY;
-    btnFlip.textContent=viewFlipY?"还原朝向":"翻转棋盘";
+    btnFlip.textContent=viewFlipY?"还原红方视角":"翻转棋盘（黑方视角）";
     if(lastSnap)renderCells(lastSnap);
   });
   onePoll();
