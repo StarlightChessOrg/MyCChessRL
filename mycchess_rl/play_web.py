@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import sys
 import threading
+import time
 from pathlib import Path
 
 # 先于 ``mycchess_rl`` 导入：从启动时的当前工作目录加载 ``xqwl_core*.so``（与 ``python mycchess_rl/play_web.py`` 无关，只看 cwd）
@@ -93,6 +94,8 @@ class XqwlWebSession:
         self.strategy_black = STRATEGY_HUMAN
         self._toasts: list[dict[str, str]] = []
         self._ai_busy = False
+        self._ai_log: list[str] = []
+        self._ai_thinking: str = ""
 
     def _raw_board(self) -> np.ndarray:
         return self.game.board_view()
@@ -168,6 +171,8 @@ class XqwlWebSession:
                 "status_text": f"轮到 {'红方' if side == 'red' else '黑方'} 走棋",
                 "ai_busy": self._ai_busy,
                 "current_strategy": self.strategy_red if side == "red" else self.strategy_black,
+                "ai_thinking": self._ai_thinking,
+                "ai_log": list(self._ai_log[-48:]),
             }
 
     def pop_client_messages(self) -> dict:
@@ -189,6 +194,10 @@ class XqwlWebSession:
             self.game.reset()
             self.sel_from = None
             self.last_move = None
+            self._ai_thinking = ""
+            self._ai_log.append("—— 新局 ——")
+            if len(self._ai_log) > 200:
+                self._ai_log[:] = self._ai_log[-120:]
         self.maybe_ai()
         return None
 
@@ -242,25 +251,51 @@ class XqwlWebSession:
             mcts_cp = self._mcts_c_puct
 
         def worker() -> None:
+            log_line = ""
             try:
+
+                def _progress(done: int, nn_e: int, nodes: int) -> None:
+                    with self._lock:
+                        self._ai_thinking = (
+                            f"MCTS 进行中 · 模拟 {done}/{mcts_sims} · "
+                            f"NN评估 {nn_e} 次 · 树节点 {nodes}"
+                        )
+
                 if use_mcts:
-                    mv = mcts_select_move_iccs(
+                    t0 = time.perf_counter()
+                    mv, st = mcts_select_move_iccs(
                         g_copy,
                         model,
                         device,
                         flist,
                         n_simulations=mcts_sims,
                         c_puct=mcts_cp,
+                        progress=_progress,
+                        progress_every=max(1, mcts_sims // 40),
+                    )
+                    dt_ms = (time.perf_counter() - t0) * 1000.0
+                    log_line = (
+                        f"MCTS | 着 {st.best_move} | {dt_ms:.0f} ms | "
+                        f"模拟×{st.n_simulations} NN×{st.nn_evaluations} "
+                        f"终端叶×{st.terminal_leaf_evals} 树节点 {st.tree_nodes} "
+                        f"根分枝 {st.root_branching} 根访问Σ {st.root_edge_visits_total}"
                     )
                 else:
                     mv = infer_greedy_move_string(g_copy, model, device, flist)
+                    log_line = f"纯网络 | 着 {mv} | 单次前向"
             except Exception as e:
                 with self._lock:
                     self._ai_busy = False
+                    self._ai_thinking = ""
                     self._toasts.append({"kind": "info", "title": "AI 错误", "body": str(e)})
                 return
             with self._lock:
                 self._ai_busy = False
+                self._ai_thinking = ""
+                if log_line:
+                    self._ai_log.append(log_line)
+                    if len(self._ai_log) > 200:
+                        self._ai_log[:] = self._ai_log[-120:]
                 if mv not in self._legal_strings():
                     self._toasts.append({"kind": "info", "title": "AI", "body": f"非法着法 {mv}"})
                     return
@@ -283,9 +318,10 @@ def _html_page() -> str:
       --muted:rgba(242,235,227,.72); --accent:#ff9800; --sel:#ffeb3b; --radius:14px; }
     *{box-sizing:border-box} body{margin:0;font-family:"Microsoft YaHei","PingFang SC",sans-serif;color:var(--text);
       min-height:100vh;background:radial-gradient(120% 80% at 50% 0%,var(--bg1) 0%,var(--bg0) 55%,#120e0a 100%)}
-    .shell{max-width:1320px;margin:0 auto;min-height:100vh;padding:clamp(14px,2.2vw,28px);
-      display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,320px);gap:clamp(16px,2.5vw,32px);align-items:center}
-    @media(max-width:860px){.shell{grid-template-columns:1fr;align-items:start}}
+    .shell{max-width:1480px;margin:0 auto;min-height:100vh;padding:clamp(14px,2.2vw,28px);
+      display:grid;grid-template-columns:minmax(200px,280px) minmax(0,1fr) minmax(240px,300px);
+      gap:clamp(14px,2.2vw,24px);align-items:start}
+    @media(max-width:960px){.shell{grid-template-columns:1fr;}.ai-log-panel{order:3;max-height:220px;}.board-wrap{order:1;}.sidepanel{order:2;}}
     .board-wrap{display:flex;justify-content:center;align-items:center}
     .board-card{background:linear-gradient(145deg,#faf3e6 0%,var(--board-bg1) 100%);border-radius:var(--radius);
       padding:clamp(10px,1.4vw,16px);box-shadow:0 4px 0 rgba(62,39,35,.35),0 18px 48px rgba(0,0,0,.45);
@@ -315,10 +351,21 @@ def _html_page() -> str:
     button.btn-secondary{margin-top:10px;background:linear-gradient(180deg,#5d6b7a 0%,#455a64 100%)}
     #status{margin-top:16px;white-space:pre-wrap;font-size:13px;padding:12px 14px;background:rgba(0,0,0,.22);border-radius:10px;min-height:4.5em}
     .ai-busy .board{opacity:.92;pointer-events:none}
+    .ai-log-panel{align-self:start}
+    .ai-thinking{min-height:2.1em;font-size:12px;color:#ffcc80;margin-bottom:8px;white-space:pre-wrap;word-break:break-word}
+    #ai-log-body{margin:0;font-family:ui-monospace,Consolas,"Courier New",monospace;font-size:11px;line-height:1.45;
+      max-height:min(560px,calc(100vh - 200px));overflow:auto;padding:10px 12px;background:rgba(0,0,0,.22);
+      border-radius:10px;color:rgba(242,235,227,.92);border:1px solid rgba(255,255,255,.06)}
   </style>
 </head>
 <body>
   <div class="shell" id="shell">
+    <div class="sidepanel ai-log-panel">
+      <h1 style="font-size:clamp(0.95rem,1.8vw,1.1rem)">AI 思考日志</h1>
+      <div class="subtitle">MCTS 时显示进度；每步结束追加摘要（节点数、NN 次数等）</div>
+      <div id="ai-thinking" class="ai-thinking"></div>
+      <pre id="ai-log-body"></pre>
+    </div>
     <div class="board-wrap"><div class="board-card"><div class="board" id="board"></div></div></div>
     <div class="sidepanel">
       <h1>MyCChessRL 象棋对弈</h1>
@@ -335,6 +382,7 @@ def _html_page() -> str:
   const shell=document.getElementById("shell"),boardEl=document.getElementById("board"),statusEl=document.getElementById("status");
   const selRed=document.getElementById("sel-red"),selBlack=document.getElementById("sel-black"),btnNew=document.getElementById("btn-new");
   const btnFlip=document.getElementById("btn-flip");
+  const aiThinkingEl=document.getElementById("ai-thinking"),aiLogBody=document.getElementById("ai-log-body");
   /* board_view：iy=0 为红方底线、iy=9 为黑方底线；须 viewFlipY=true 才使屏幕「下」为红（红方在下面） */
   let viewFlipY=true,pollTimer=null,lastSnap=null;
   function showAlert(t,b){alert(t+"\\n\\n"+b);}
@@ -363,6 +411,11 @@ def _html_page() -> str:
   function applySnap(snap){
     fillStrategiesOnce(snap.strategies||[]);selRed.value=snap.strategy_red;selBlack.value=snap.strategy_black;
     statusEl.textContent=snap.status_text||"";
+    if(aiThinkingEl) aiThinkingEl.textContent=snap.ai_thinking||"";
+    if(aiLogBody){
+      aiLogBody.textContent=(snap.ai_log||[]).join("\\n");
+      aiLogBody.scrollTop=aiLogBody.scrollHeight;
+    }
     /* 每次刷新都重绘：避免仅依赖 visual_sig 时 ai_busy / 选子 / 行棋方 变化但 DOM 未更新，导致误判「无法走黑」或遮罩不消 */
     renderCells(snap);
     shell.classList.toggle("ai-busy",!!snap.ai_busy);
