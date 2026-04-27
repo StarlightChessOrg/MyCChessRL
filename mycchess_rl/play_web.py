@@ -322,11 +322,11 @@ def _html_page() -> str:
     <div class="board-wrap"><div class="board-card"><div class="board" id="board"></div></div></div>
     <div class="sidepanel">
       <h1>MyCChessRL 象棋对弈</h1>
-      <div class="subtitle">XQWL 规则核 · 开局双方人类 · 棋盘默认红方在下 · 纯网络 / MCTS 可选</div>
+      <div class="subtitle">XQWL 规则核 · 开局双方人类 · 棋盘默认红方在下面 · 纯网络 / MCTS 可选</div>
       <label>红方策略</label><select id="sel-red"></select>
       <label>黑方策略</label><select id="sel-black"></select>
       <button type="button" id="btn-new">新局</button>
-      <button type="button" class="btn-secondary" id="btn-flip" title="当前为红方视角（红在下）；点击后黑方在下">翻转棋盘（黑方视角）</button>
+      <button type="button" class="btn-secondary" id="btn-flip" title="默认：红方棋子在棋盘下方；点击后黑方在下面">翻转棋盘（黑方视角）</button>
       <div id="status"></div>
     </div>
   </div>
@@ -335,14 +335,15 @@ def _html_page() -> str:
   const shell=document.getElementById("shell"),boardEl=document.getElementById("board"),statusEl=document.getElementById("status");
   const selRed=document.getElementById("sel-red"),selBlack=document.getElementById("sel-black"),btnNew=document.getElementById("btn-new");
   const btnFlip=document.getElementById("btn-flip");
-  let viewFlipY=false,pollTimer=null,lastSnap=null;
+  /* board_view：iy=0 为红方底线、iy=9 为黑方底线；须 viewFlipY=true 才使屏幕「下」为红（红方在下面） */
+  let viewFlipY=true,pollTimer=null,lastSnap=null;
   function showAlert(t,b){alert(t+"\\n\\n"+b);}
   function fillStrategiesOnce(strategies){
     if(selRed.options.length>0)return;
     strategies.forEach(function(t){var o=document.createElement("option");o.value=o.textContent=t;selRed.appendChild(o);});
     strategies.forEach(function(t){var o=document.createElement("option");o.value=o.textContent=t;selBlack.appendChild(o);});
   }
-  /** 视觉行 iyVis -> 服务端棋盘行 iy（红在下坐标系） */
+  /** 视觉行 iyVis（上→下）→ snap.board 行 iy；viewFlipY=true 时屏幕下沿为红方（iy=0） */
   function srvY(iyVis){return viewFlipY?(9-iyVis):iyVis;}
   function renderCells(snap){
     var lm=snap.last_move,sf=snap.sel_from,frag=document.createDocumentFragment();
@@ -402,7 +403,7 @@ def _html_page() -> str:
   });
   btnFlip.addEventListener("click",function(){
     viewFlipY=!viewFlipY;
-    btnFlip.textContent=viewFlipY?"还原红方视角":"翻转棋盘（黑方视角）";
+    btnFlip.textContent=viewFlipY?"翻转棋盘（黑方视角）":"还原红方在下面";
     if(lastSnap)renderCells(lastSnap);
   });
   onePoll();
