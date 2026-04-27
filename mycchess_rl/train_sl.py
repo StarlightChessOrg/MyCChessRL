@@ -46,6 +46,9 @@ from mycchess_rl.sl_data import (
 
 _LOG = logging.getLogger("mycchess_rl.train_sl")
 
+# 价值 MSE 先乘该系数再与 --value-loss-weight 相乘进总损失，降低价值项梯度占比、减轻震荡
+SL_VALUE_LOSS_GLOBAL_SCALE = 0.1
+
 
 def _batch_tensors_to_device(
     x_np: np.ndarray,
@@ -241,7 +244,12 @@ def main() -> None:
     )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--value-loss-weight", type=float, default=0.25, help="价值 MSE 相对策略 CE 权重")
+    p.add_argument(
+        "--value-loss-weight",
+        type=float,
+        default=0.25,
+        help="价值 MSE 权重；实际进总损失为 %.1f×本参数×MSE（削弱价值项、稳训练）" % (SL_VALUE_LOSS_GLOBAL_SCALE,),
+    )
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument(
         "--checkpoint",
@@ -386,11 +394,11 @@ def main() -> None:
             prefetch_batches,
         )
         vl_w = float(args.value_loss_weight)
+        eff_vw = SL_VALUE_LOSS_GLOBAL_SCALE * vl_w
         _LOG.info(
-            "损失 total = pol_CE + (%.4g × val_MSE)；value_scale=%.4g。"
-            "训练初期价值头未拟合时 val 项常远大于 pol（tot 可到十几～二十以上），"
-            "随 val_MSE 下降后 total 会主要由 pol≈log(合法着法数) 主导（常见约 3～6）。",
-            vl_w,
+            "损失 total = pol_CE + (eff×val_MSE)，eff=%.4g（=0.1×--value-loss-weight）；value_scale=%.4g。"
+            "价值项缩小后 tot 更接近 pol；若仍觉 val 过强可调小 --value-loss-weight。",
+            eff_vw,
             float(model.value_scale),
         )
 
@@ -436,9 +444,9 @@ def main() -> None:
                     loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
                 else:
                     loss_v = torch.zeros((), device=device)
-                loss = loss_p + vl_w * loss_v
+                loss = loss_p + eff_vw * loss_v
                 loss_p_det = float(loss_p.detach().item())
-                loss_v_w_det = vl_w * float(loss_v.detach().item())
+                loss_v_w_det = eff_vw * float(loss_v.detach().item())
                 loss.backward()
                 opt.step()
                 global_step += 1
@@ -512,11 +520,11 @@ def main() -> None:
                         loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
                     else:
                         loss_v = torch.zeros((), device=device)
-                    loss = loss_p + vl_w * loss_v
+                    loss = loss_p + eff_vw * loss_v
                     pred = logits_masked.argmax(dim=-1)
                     v_b = float(loss.item())
                     pol_b = float(loss_p.detach().item())
-                    vw_b = vl_w * float(loss_v.detach().item())
+                    vw_b = eff_vw * float(loss_v.detach().item())
                     a_b = float((pred == tgt).float().mean().item() * 100.0)
                     v_losses.append(v_b)
                     v_accs.append(a_b)
