@@ -127,13 +127,16 @@ def iter_joint_sl_samples_from_cbf(
     root = tree.getroot()
     head = root.find("Head")
     if head is None:
+        del tree
         return
     fen_el = head.find("FEN")
     fen = (fen_el.text or "").strip() if fen_el is not None else ""
     if not _fen_matches_standard_start(fen):
+        del tree
         return
     red_cls = _red_outcome_class_from_head(head)
     moves = _move_values_from_movelist(root)
+    del tree, root
     st = XqwlGameState()
     st.reset()
     for mv in moves:
@@ -149,7 +152,8 @@ def iter_joint_sl_samples_from_cbf(
         mask = np.zeros((policy_max_legal,), dtype=np.bool_)
         mask[: len(legs)] = True
         idx = int(legs.index(mv))
-        chw = encode_states_inline([st])[0].astype(np.float32, copy=False)
+        # 独立拷贝，避免与编码/下一局缓冲区共享底层存储导致未定义行为或堆损坏
+        chw = np.array(encode_states_inline([st])[0], dtype=np.float32, copy=True)
         stm_cls = int(stm_outcome_class_from_red_outcome(red_cls, bool(st.red_to_move)))
         if stm_cls == VALUE_LABEL_IGNORE:
             has_v = False
@@ -197,8 +201,8 @@ def _dataloader_worker_init(_worker_id: int) -> None:
 def collate_joint_sl_batch(
     batch: list[tuple[np.ndarray, np.ndarray, np.int64, np.float32, bool]],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    x = np.stack([b[0] for b in batch], axis=0)
-    m = np.stack([b[1] for b in batch], axis=0)
+    x = np.stack([np.ascontiguousarray(np.array(b[0], dtype=np.float32, copy=True)) for b in batch], axis=0)
+    m = np.stack([np.ascontiguousarray(np.array(b[1], dtype=np.bool_, copy=True)) for b in batch], axis=0)
     yi = np.stack([np.int64(b[2]) for b in batch], axis=0)
     vs = np.stack([np.float32(b[3]) for b in batch], axis=0)
     hv = np.stack([np.bool_(b[4]) for b in batch], axis=0)
@@ -244,7 +248,6 @@ def make_joint_sl_dataloader(
     pin_memory: bool = False,
     prefetch_factor: int = 2,
     drop_last: bool = True,
-    pin_memory_device: str | None = None,
 ) -> DataLoader:
     ds = JointCBFIterableDataset(sources, policy_max_legal=policy_max_legal)
     kw: dict[str, Any] = {
@@ -261,11 +264,6 @@ def make_joint_sl_dataloader(
         kw["worker_init_fn"] = _dataloader_worker_init
         if sys.platform == "win32":
             kw["multiprocessing_context"] = "spawn"
-    if pin_memory and pin_memory_device is not None:
-        try:
-            kw["pin_memory_device"] = pin_memory_device
-        except TypeError:
-            pass
     return DataLoader(**kw)
 
 
@@ -278,7 +276,6 @@ def build_joint_sl_train_val_loaders(
     num_workers: int = 0,
     prefetch_factor: int = 2,
     pin_memory: bool = False,
-    pin_memory_device: str | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     train_loader = make_joint_sl_dataloader(
         train_sources,
@@ -288,7 +285,6 @@ def build_joint_sl_train_val_loaders(
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
         drop_last=True,
-        pin_memory_device=pin_memory_device,
     )
     val_loader = make_joint_sl_dataloader(
         val_sources,
@@ -298,6 +294,5 @@ def build_joint_sl_train_val_loaders(
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
         drop_last=False,
-        pin_memory_device=pin_memory_device,
     )
     return train_loader, val_loader

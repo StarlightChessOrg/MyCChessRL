@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import sys
 import time
@@ -164,6 +165,13 @@ def main() -> None:
         _LOG.error("请指定 --cbf-root 或 --cbf-manifest")
         raise SystemExit(2)
 
+    _LOG.info(
+        "训练吞吐说明: 每 epoch 跑 --n-batch-train=%d 批 × --batch-size=%d 条样本（Iterable 无限循环）；"
+        "日志里的 train/val 是「棋谱文件个数」，不是每 epoch 步数。仅 Head/FEN 与标准开局一致 的 .cbf 才会产生样本，其余对局整盘跳过。",
+        int(args.n_batch_train),
+        int(args.batch_size),
+    )
+
     device = torch.device("cpu")
     if args.gpu >= 0 and torch.cuda.is_available():
         device = torch.device(f"cuda:{args.gpu}")
@@ -212,8 +220,7 @@ def main() -> None:
     for g in opt.param_groups:
         g["lr"] = float(args.lr)
     pm = model.policy_max_legal
-    pin_mem = device.type == "cuda"
-    pin_dev = str(device) if pin_mem else None
+    # Iterable + from_numpy：不用 DataLoader pin_memory，避免 PyTorch 对 pin_memory_device 的弃用警告及潜在 pinned 堆问题
     train_loader, val_loader = build_joint_sl_train_val_loaders(
         train_files,
         val_files,
@@ -221,8 +228,7 @@ def main() -> None:
         policy_max_legal=pm,
         num_workers=int(args.num_workers),
         prefetch_factor=int(args.prefetch_factor),
-        pin_memory=pin_mem,
-        pin_memory_device=pin_dev,
+        pin_memory=False,
     )
 
     train_it = iter(train_loader)
@@ -241,11 +247,11 @@ def main() -> None:
                 train_it = iter(train_loader)
                 x_np, m_np, yi_np, vs_np, hv_np = next(train_it)
 
-            x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device, non_blocking=pin_mem)
-            mask = torch.from_numpy(m_np).to(device, non_blocking=pin_mem)
-            tgt = torch.from_numpy(yi_np.astype(np.int64)).to(device, non_blocking=pin_mem)
-            v_sign = torch.from_numpy(vs_np).to(device, non_blocking=pin_mem)
-            has_v = torch.from_numpy(hv_np).to(device, non_blocking=pin_mem)
+            x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device)
+            mask = torch.from_numpy(np.ascontiguousarray(m_np)).to(device)
+            tgt = torch.from_numpy(np.ascontiguousarray(yi_np.astype(np.int64))).to(device)
+            v_sign = torch.from_numpy(np.ascontiguousarray(vs_np)).to(device)
+            has_v = torch.from_numpy(np.ascontiguousarray(hv_np)).to(device)
 
             opt.zero_grad(set_to_none=True)
             logits_m, v_pred = model(x)
@@ -294,11 +300,11 @@ def main() -> None:
                 except StopIteration:
                     val_it = iter(val_loader)
                     x_np, m_np, yi_np, vs_np, hv_np = next(val_it)
-                x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device, non_blocking=pin_mem)
-                mask = torch.from_numpy(m_np).to(device, non_blocking=pin_mem)
-                tgt = torch.from_numpy(yi_np.astype(np.int64)).to(device, non_blocking=pin_mem)
-                v_sign = torch.from_numpy(vs_np).to(device, non_blocking=pin_mem)
-                has_v = torch.from_numpy(hv_np).to(device, non_blocking=pin_mem)
+                x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device)
+                mask = torch.from_numpy(np.ascontiguousarray(m_np)).to(device)
+                tgt = torch.from_numpy(np.ascontiguousarray(yi_np.astype(np.int64))).to(device)
+                v_sign = torch.from_numpy(np.ascontiguousarray(vs_np)).to(device)
+                has_v = torch.from_numpy(np.ascontiguousarray(hv_np)).to(device)
                 logits_m, v_pred = model(x)
                 logits_masked = logits_m.masked_fill(~mask, -1e9)
                 loss_p = F.cross_entropy(logits_masked, tgt)
@@ -323,6 +329,10 @@ def main() -> None:
 
         last = save_dir / "last.pt"
         _save_ckpt(last, model, opt, epoch=epoch, global_step=global_step, best_val=best_val)
+
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     dt = time.perf_counter() - t0
     _LOG.info("监督训练结束 wall=%.1fs | best_val_loss=%.4f | last=%s", dt, best_val, (save_dir / "last.pt").resolve())
