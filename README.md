@@ -42,7 +42,8 @@ cmake --build . --config Release
 | `mycchess_rl/train_ppo.py` | PPO 示意训练 |
 | `mycchess_rl/train_sl.py` | icyElephant 风格 XML ``.cbf`` 监督学习（联合策略头 + 价值 MSE） |
 | `mycchess_rl/sl_data.py` | 棋谱 IterableDataset / DataLoader |
-| `mycchess_rl/play_web.py` | Sanic 网页对弈 |
+| `mycchess_rl/play_web.py` | Sanic 网页对弈（纯网络 / MCTS） |
+| `mycchess_rl/mcts_joint.py` | AlphaZero 式 PUCT + 联合策略先验与 NN 价值 |
 
 ## 训练与对弈
 
@@ -53,6 +54,8 @@ python -m mycchess_rl.train_ppo --save-dir runs --save-every 100
 python -m mycchess_rl.train_ppo --resume --save-dir runs
 python -m mycchess_rl.train_ppo --resume --checkpoint runs/weights/upd_000499.pt
 mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
+# 网页侧下拉选「MCTS」；PUCT 次数与 c_puct 可调：
+mycchess-play-web --checkpoint path/to.pt --mcts-simulations 800 --mcts-c-puct 1.5
 ```
 
 **监督学习（cbf）**：与 [icyElephant](https://github.com/bupticybee/icyElephant) / MyElephant 相同 **XML ``ChineseChessRecord``** 棋谱；在 ``xqwl_core`` 上回放，对 **排序后的合法 ICCS 槽位** 做交叉熵，对 **行棋方终局**（``RecordResult`` 与 icy 一致：1 红胜 / 2 黑胜 / 3–4 和）做 **MSE 到 ``±value_scale`` / 0**。**当前引擎无 ``set_fen``**，仅加载 **与标准起始局面一致** 的 ``Head/FEN`` 的棋谱；中局起点或规则与 xqwl 不一致的着法会 **静默跳过** 该文件。

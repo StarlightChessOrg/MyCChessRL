@@ -90,6 +90,44 @@ def _encode_state_current_nchw(state: XqwlGameState, flist: dict[str, list[str]]
 
 
 @torch.no_grad()
+def infer_joint_policy_prior_and_value(
+    state: XqwlGameState,
+    model: JointPolicyValueNet,
+    device: torch.device,
+    flist: dict[str, list[str]],
+    *,
+    policy_temperature: float = 1.0,
+) -> tuple[list[str], np.ndarray, float]:
+    """
+    返回 ``(sorted_legal_iccs, prob[L], v_norm)``。
+    ``prob`` 在合法着法上归一化和为 1；``v_norm = v_net / value_scale``，约 ``(-1,1)``，表示**当前行棋方**的网络价值（与 SL 训练一致）。
+    """
+    legs = sorted_legal_iccs(state)
+    if not legs:
+        return [], np.zeros((0,), dtype=np.float64), 0.0
+    M = model.policy_max_legal
+    if len(legs) > M:
+        raise RuntimeError(f"合法着法数 {len(legs)} > policy_max_legal={M}")
+    x_cur = _encode_state_current_nchw(state, flist, device)
+    model.eval()
+    T = policy_temperature_scalar(policy_temperature)
+    logits_m, v = model(x_cur)
+    mask = torch.zeros(1, M, dtype=torch.bool, device=device)
+    mask[0, : len(legs)] = True
+    scaled = (logits_m / T).masked_fill(~mask, -1e9)
+    p = torch.softmax(scaled, dim=1)[0, : len(legs)].detach().float().cpu().numpy()
+    s = float(p.sum())
+    if s > 0:
+        p = p / s
+    else:
+        p = np.full(len(legs), 1.0 / len(legs), dtype=np.float64)
+    vs = max(float(model.value_scale), 1e-6)
+    v_norm = float(v.item()) / vs
+    v_norm = max(-1.0, min(1.0, v_norm))
+    return legs, p.astype(np.float64, copy=False), v_norm
+
+
+@torch.no_grad()
 def infer_greedy_move_string(
     state: XqwlGameState,
     model: JointPolicyValueNet,

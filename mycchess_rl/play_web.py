@@ -19,11 +19,13 @@ from mycchess_rl.iccs_util import parse_move_squares
 from mycchess_rl.xqwl_state import REP_RULE_VALUE_DRAWISH_ABS
 from mycchess_rl.chess.session import GamePlay
 from mycchess_rl.model import load_policy_value_for_play
+from mycchess_rl.mcts_joint import mcts_select_move_iccs
 from mycchess_rl.policy_inference import infer_greedy_move_string
 
 STRATEGY_HUMAN = "人类"
 STRATEGY_NEURAL = "纯网络"
-STRATEGIES = (STRATEGY_HUMAN, STRATEGY_NEURAL)
+STRATEGY_MCTS = "MCTS"
+STRATEGIES = (STRATEGY_HUMAN, STRATEGY_NEURAL, STRATEGY_MCTS)
 
 _PIECE_CHAR = {
     "R": "车",
@@ -68,11 +70,21 @@ def _select_device(gpu: int) -> torch.device:
 
 
 class XqwlWebSession:
-    def __init__(self, model, device: torch.device, flist: dict) -> None:
+    def __init__(
+        self,
+        model,
+        device: torch.device,
+        flist: dict,
+        *,
+        mcts_simulations: int = 400,
+        mcts_c_puct: float = 1.5,
+    ) -> None:
         self._lock = threading.Lock()
         self.model = model
         self.device = device
         self.flist = flist
+        self._mcts_simulations = max(1, int(mcts_simulations))
+        self._mcts_c_puct = float(mcts_c_puct)
         self.game = GamePlay()
         self.sel_from: tuple[int, int] | None = None  # board_view 坐标 (ix, iy)
         # 上一着 ICCS 引擎坐标 (x1,y1,x2,y2)，与 ``legal_moves_iccs`` 一致
@@ -216,7 +228,7 @@ class XqwlWebSession:
                 return
             side = self.game.get_side()
             strat = self.strategy_red if side == "red" else self.strategy_black
-            if strat != STRATEGY_NEURAL:
+            if strat not in (STRATEGY_NEURAL, STRATEGY_MCTS):
                 return
             if self.game.terminal()[0]:
                 return
@@ -225,10 +237,23 @@ class XqwlWebSession:
             self._ai_busy = True
             model, device, flist = self.model, self.device, self.flist
             g_copy = self.game.copy()
+            use_mcts = strat == STRATEGY_MCTS
+            mcts_sims = self._mcts_simulations
+            mcts_cp = self._mcts_c_puct
 
         def worker() -> None:
             try:
-                mv = infer_greedy_move_string(g_copy, model, device, flist)
+                if use_mcts:
+                    mv = mcts_select_move_iccs(
+                        g_copy,
+                        model,
+                        device,
+                        flist,
+                        n_simulations=mcts_sims,
+                        c_puct=mcts_cp,
+                    )
+                else:
+                    mv = infer_greedy_move_string(g_copy, model, device, flist)
             except Exception as e:
                 with self._lock:
                     self._ai_busy = False
@@ -297,7 +322,7 @@ def _html_page() -> str:
     <div class="board-wrap"><div class="board-card"><div class="board" id="board"></div></div></div>
     <div class="sidepanel">
       <h1>MyCChessRL 象棋对弈</h1>
-      <div class="subtitle">XQWL 规则核 · Sanic · 两阶段策略网络</div>
+      <div class="subtitle">XQWL 规则核 · Sanic · 纯网络 / MCTS(PUCT+NN)</div>
       <label>红方策略</label><select id="sel-red"></select>
       <label>黑方策略</label><select id="sel-black"></select>
       <button type="button" id="btn-new">新局</button>
@@ -400,6 +425,18 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument(
+        "--mcts-simulations",
+        type=int,
+        default=400,
+        help="选 MCTS 策略时每步模拟次数（PUCT）；越大越强但更慢",
+    )
+    p.add_argument(
+        "--mcts-c-puct",
+        type=float,
+        default=1.5,
+        help="PUCT 探索系数 c_puct",
+    )
+    p.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -409,10 +446,16 @@ def main() -> None:
 
     device = _select_device(int(args.gpu))
     model, flist = load_policy_value_for_play(args.checkpoint, device)
-    session = XqwlWebSession(model, device, flist)
+    session = XqwlWebSession(
+        model,
+        device,
+        flist,
+        mcts_simulations=int(args.mcts_simulations),
+        mcts_c_puct=float(args.mcts_c_puct),
+    )
 
     app = Sanic("mycchess_rl_play_web")
-    app.config.RESPONSE_TIMEOUT = 120
+    app.config.RESPONSE_TIMEOUT = max(120, int(args.mcts_simulations) // 2)
 
     @app.get("/")
     async def _index(_request):
