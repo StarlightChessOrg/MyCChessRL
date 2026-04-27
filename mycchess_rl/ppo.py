@@ -1,4 +1,4 @@
-"""PPO 辅助：GAE 与联合策略-价值更新（两阶段离散动作）。"""
+"""PPO 辅助：GAE 与联合合法着法分布 + 标量价值的更新。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from mycchess_rl.model import SuccessorPolicy, policy_temperature_scalar
+from mycchess_rl.model import JointPolicyValueNet, policy_temperature_scalar
 
 
 @dataclass
@@ -44,17 +44,11 @@ def compute_gae(
     return adv, ret
 
 
-def value_expectation_from_logits(logits_v: torch.Tensor) -> torch.Tensor:
-    p = torch.softmax(logits_v.float(), dim=-1)
-    w = torch.tensor([3.0, 1.0, -3.0], device=logits_v.device, dtype=logits_v.dtype)
-    return (p * w).sum(dim=-1)
-
-
-def _ppo_forward_loss(
-    model: SuccessorPolicy,
+def _ppo_forward_loss_joint(
+    model: JointPolicyValueNet,
     obs: torch.Tensor,
-    src_oh: torch.Tensor,
-    dst_oh: torch.Tensor,
+    legal_mask: torch.Tensor,
+    action_idx: torch.Tensor,
     old_logp: torch.Tensor,
     adv: torch.Tensor,
     ret_value: torch.Tensor,
@@ -62,47 +56,25 @@ def _ppo_forward_loss(
     cfg: PPOConfig,
     *,
     policy_temperature: float = 1.0,
-    src_legal_mask: torch.Tensor | None = None,
-    dst_legal_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """一次前向：返回可反传的 ``loss`` 及 detached 日志字典（对该 mini-batch 的 mean）。
-
-    当提供 ``src_legal_mask``/``dst_legal_mask`` 时，与 ``batched_two_stage_logprob_on_moves`` 相同：
-    ``logits/T`` 后仅在合法着法维上做 ``log_softmax``；否则退化为全 90 维（与旧行为一致）。
-    """
     T = policy_temperature_scalar(policy_temperature)
-    logits_s, logits_d, logits_v = model(obs, src_oh)
-    scaled_s = logits_s / T
-    scaled_d = logits_d / T
+    logits_m, v_pred = model(obs)
+    scaled = logits_m / T
+    scaled = scaled.masked_fill(~legal_mask, -1e9)
+    log_p_all = F.log_softmax(scaled, dim=1)
+    logp = log_p_all.gather(1, action_idx.unsqueeze(1)).squeeze(1)
+    p = torch.softmax(scaled, dim=1)
+    ent_row = -(p * log_p_all).sum(dim=1)
+    ent = ent_row.mean()
 
-    if src_legal_mask is not None:
-        ls_m = scaled_s.masked_fill(~src_legal_mask, -1e9)
-        logp_s = (F.log_softmax(ls_m, dim=1) * src_oh).sum(dim=1)
-        p_s = F.softmax(ls_m, dim=1)
-        ent_s = (-(p_s * F.log_softmax(ls_m, dim=1)).sum(1)).mean()
-    else:
-        logp_s = (F.log_softmax(logits_s, dim=1) * src_oh).sum(dim=1)
-        ent_s = (-(F.softmax(logits_s, 1) * F.log_softmax(logits_s, 1)).sum(1)).mean()
-
-    if dst_legal_mask is not None:
-        ld_m = scaled_d.masked_fill(~dst_legal_mask, -1e9)
-        logp_d = (F.log_softmax(ld_m, dim=1) * dst_oh).sum(dim=1)
-        p_d = F.softmax(ld_m, dim=1)
-        ent_d = (-(p_d * F.log_softmax(ld_m, dim=1)).sum(1)).mean()
-    else:
-        logp_d = (F.log_softmax(logits_d, dim=1) * dst_oh).sum(dim=1)
-        ent_d = (-(F.softmax(logits_d, 1) * F.log_softmax(logits_d, 1)).sum(1)).mean()
-
-    logp = torch.clamp(logp_s + logp_d, -80.0, 0.0)
+    logp = torch.clamp(logp, -80.0, 0.0)
     old_logp_c = torch.clamp(old_logp, -80.0, 0.0)
     ratio = torch.exp(torch.clamp(logp - old_logp_c, -5.0, 5.0))
     ratio = torch.clamp(ratio, 0.0, 32.0)
     surr1 = ratio * adv
     surr2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * adv
     pol_loss = -torch.min(surr1, surr2).mean()
-    v_pred = value_expectation_from_logits(logits_v)
     v_loss = F.smooth_l1_loss(v_pred, ret_value, beta=0.5)
-    ent = ent_s + ent_d
     loss = pol_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent
 
     clip_lo, clip_hi = 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps
@@ -114,8 +86,6 @@ def _ppo_forward_loss(
             "pol": float(pol_loss.detach().cpu()),
             "v": float(v_loss.detach().cpu()),
             "ent": float(ent.detach().cpu()),
-            "ent_s": float(ent_s.detach().cpu()),
-            "ent_d": float(ent_d.detach().cpu()),
             "ratio_mean": float(ratio.mean().cpu()),
             "ratio_sq_mean": float((ratio * ratio).mean().cpu()),
             "clip_frac": float(clip_frac.detach().cpu()),
@@ -127,11 +97,11 @@ def _ppo_forward_loss(
 
 
 def policy_value_loss_step(
-    model: SuccessorPolicy,
+    model: JointPolicyValueNet,
     opt: torch.optim.Optimizer,
     obs: torch.Tensor,
-    src_oh: torch.Tensor,
-    dst_oh: torch.Tensor,
+    legal_mask: torch.Tensor,
+    action_idx: torch.Tensor,
     old_logp: torch.Tensor,
     adv: torch.Tensor,
     ret_value: torch.Tensor,
@@ -140,15 +110,12 @@ def policy_value_loss_step(
     *,
     mini_batch_size: int | None = None,
     policy_temperature: float = 1.0,
-    src_legal_mask: torch.Tensor | None = None,
-    dst_legal_mask: torch.Tensor | None = None,
 ) -> tuple[float, dict[str, float]]:
     """
     PPO 更新。``mini_batch_size`` 为 None 或 ≥ N 时整批一次前向；
-    否则按小批 **梯度累积**：``backward(loss * k/N)``，等价于全样本平均梯度，峰值显存随小批大小变化。
+    否则按小批梯度累积。
 
-    使用 ``model.eval()``：ResNet 中含 BatchNorm 时，必须与 rollout / ``old_logp`` 的 eval 前向一致，
-    否则 train 下 BN 用 batch 统计量会导致 ``logp`` 与 ``old_logp`` 不可比，ratio/approx_kl 失真。
+    使用 ``model.eval()``：ResNet 中含 BatchNorm 时，必须与 rollout / ``old_logp`` 的 eval 前向一致。
     """
     model.eval()
     n = int(obs.shape[0])
@@ -157,19 +124,17 @@ def policy_value_loss_step(
 
     mbs = n if mini_batch_size is None else max(1, int(mini_batch_size))
     if mbs >= n:
-        loss, dbg = _ppo_forward_loss(
+        loss, dbg = _ppo_forward_loss_joint(
             model,
             obs,
-            src_oh,
-            dst_oh,
+            legal_mask,
+            action_idx,
             old_logp,
             adv,
             ret_value,
             old_v,
             cfg,
             policy_temperature=policy_temperature,
-            src_legal_mask=src_legal_mask,
-            dst_legal_mask=dst_legal_mask,
         )
         opt.zero_grad()
         loss.backward()
@@ -183,8 +148,8 @@ def policy_value_loss_step(
             "loss_value": dbg["v"],
             "loss_vf_weighted": cfg.vf_coef * dbg["v"],
             "entropy_sum": dbg["ent"],
-            "entropy_src": dbg["ent_s"],
-            "entropy_dst": dbg["ent_d"],
+            "entropy_src": dbg["ent"],
+            "entropy_dst": 0.0,
             "ratio_mean": rm,
             "ratio_std": rstd,
             "clip_frac": dbg["clip_frac"],
@@ -199,7 +164,7 @@ def policy_value_loss_step(
         return metrics["loss_total"], metrics
 
     opt.zero_grad()
-    acc_pol = acc_v = acc_ent = acc_ents = acc_entd = 0.0
+    acc_pol = acc_v = acc_ent = 0.0
     acc_rm = acc_r2 = 0.0
     acc_clip = acc_kl = 0.0
     acc_vpred = acc_oldv = 0.0
@@ -208,29 +173,23 @@ def policy_value_loss_step(
     for start in range(0, n, mbs):
         end = min(start + mbs, n)
         w = (end - start) / n
-        sm = None if src_legal_mask is None else src_legal_mask[start:end]
-        dm = None if dst_legal_mask is None else dst_legal_mask[start:end]
-        loss_mb, dbg = _ppo_forward_loss(
+        loss_mb, dbg = _ppo_forward_loss_joint(
             model,
             obs[start:end],
-            src_oh[start:end],
-            dst_oh[start:end],
+            legal_mask[start:end],
+            action_idx[start:end],
             old_logp[start:end],
             adv[start:end],
             ret_value[start:end],
             old_v[start:end],
             cfg,
             policy_temperature=policy_temperature,
-            src_legal_mask=sm,
-            dst_legal_mask=dm,
         )
         (loss_mb * w).backward()
         acc_loss_log += float(loss_mb.detach().cpu()) * w
         acc_pol += dbg["pol"] * w
         acc_v += dbg["v"] * w
         acc_ent += dbg["ent"] * w
-        acc_ents += dbg["ent_s"] * w
-        acc_entd += dbg["ent_d"] * w
         acc_rm += dbg["ratio_mean"] * w
         acc_r2 += dbg["ratio_sq_mean"] * w
         acc_clip += dbg["clip_frac"] * w
@@ -247,8 +206,8 @@ def policy_value_loss_step(
         "loss_value": acc_v,
         "loss_vf_weighted": cfg.vf_coef * acc_v,
         "entropy_sum": acc_ent,
-        "entropy_src": acc_ents,
-        "entropy_dst": acc_entd,
+        "entropy_src": acc_ent,
+        "entropy_dst": 0.0,
         "ratio_mean": acc_rm,
         "ratio_std": rstd,
         "clip_frac": acc_clip,
@@ -261,14 +220,3 @@ def policy_value_loss_step(
         "old_v_mean": acc_oldv,
     }
     return acc_loss_log, metrics
-
-
-def iccs_to_src_dst_onehot(iccs: str, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-    x1, y1, x2, y2 = int(iccs[0]), int(iccs[1]), int(iccs[3]), int(iccs[4])
-    s = y1 * 9 + x1
-    d = y2 * 9 + x2
-    oh_s = torch.zeros(90, device=device, dtype=dtype)
-    oh_d = torch.zeros(90, device=device, dtype=dtype)
-    oh_s[s] = 1.0
-    oh_d[d] = 1.0
-    return oh_s, oh_d

@@ -1,4 +1,4 @@
-"""两阶段策略塔（起点 + 落点 + 行棋方三分类价值）；根卷积输入通道与 icyElephant 14 路棋子平面一致。"""
+"""合法着法联合策略 + 标量价值（与旧两阶段 head 不兼容，需重新训练）。"""
 from __future__ import annotations
 
 import math
@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mycchess_rl.chess.rationale import POLICY_GRID_NUMEL, POLICY_SELECT_IN_CHANNELS
+from mycchess_rl.chess.rationale import POLICY_MAX_LEGAL_MOVES, POLICY_SELECT_IN_CHANNELS
 
 
 def count_resnet_blocks_in_state(sd: dict, prefix: str = "blocks.") -> int:
@@ -42,46 +42,49 @@ class ResBlock(nn.Module):
         return F.elu(out)
 
 
-class SuccessorPolicy(nn.Module):
-    """(B,C,10,9) → logits_src (B,90), logits_dst (B,90|feat+src_oh), logits_val (B,3)。"""
+class JointPolicyValueNet(nn.Module):
+    """(B,C,10,9) → 对至多 ``policy_max_legal`` 个**有序合法着法槽位**的 logits；价值为 ``tanh·value_scale`` 标量。"""
 
     def __init__(
         self,
         num_res_layers: int = 10,
         in_channels: int | None = None,
         filters: int = 256,
-        grid: int = POLICY_GRID_NUMEL,
+        *,
+        policy_max_legal: int | None = None,
+        value_scale: float = 10.0,
     ) -> None:
         super().__init__()
         c = in_channels if in_channels is not None else POLICY_SELECT_IN_CHANNELS
-        self.in_channels = c
-        self.grid = grid
-        self.filters = filters
-        self.stem_conv = nn.Conv2d(c, filters, 3, padding=1, bias=False)
-        self.stem_bn = nn.BatchNorm2d(filters)
-        self.blocks = nn.Sequential(*[ResBlock(filters) for _ in range(num_res_layers)])
+        self.in_channels = int(c)
+        self.filters = int(filters)
+        self.num_res_layers = int(num_res_layers)
+        self.policy_max_legal = int(policy_max_legal or POLICY_MAX_LEGAL_MOVES)
+        self.value_scale = float(value_scale)
+
+        self.stem_conv = nn.Conv2d(self.in_channels, self.filters, 3, padding=1, bias=False)
+        self.stem_bn = nn.BatchNorm2d(self.filters)
+        self.blocks = nn.Sequential(*[ResBlock(self.filters) for _ in range(self.num_res_layers)])
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.head_src = nn.Linear(filters, grid)
-        self.head_dst = nn.Linear(filters + grid, grid)
-        self.value_head = nn.Linear(filters, 3)
+        self.policy_head = nn.Linear(self.filters, self.policy_max_legal)
+        self.value_fc = nn.Linear(self.filters, 1)
 
     def _trunk_flat(self, x_nchw: torch.Tensor) -> torch.Tensor:
         t = F.elu(self.stem_bn(self.stem_conv(x_nchw)))
         t = self.blocks(t)
         return self.pool(t).flatten(1)
 
-    def forward(
-        self, x_cur: torch.Tensor, src_one_hot: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        feat = self._trunk_flat(x_cur)
-        logits_src = self.head_src(feat)
-        logits_dst = self.head_dst(torch.cat([feat, src_one_hot], dim=1))
-        logits_val = self.value_head(feat)
-        return logits_src, logits_dst, logits_val
+    def forward_heads_from_feat(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits_moves = self.policy_head(feat)
+        v = torch.tanh(self.value_fc(feat).squeeze(-1)) * self.value_scale
+        return logits_moves, v
+
+    def forward(self, x_nchw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_heads_from_feat(self._trunk_flat(x_nchw))
 
 
 def torch_load_checkpoint(path: str | Path, map_location: torch.device | str) -> dict:
-    p = Path(path)
+    p = Path(p)
     try:
         return torch.load(p, map_location=map_location, weights_only=False)
     except TypeError:
@@ -95,12 +98,12 @@ def _infer_filters_from_state(sd: dict) -> int:
     return 256
 
 
-def load_successor_policy_for_play(
+def load_policy_value_for_play(
     checkpoint: Path,
     device: torch.device,
     *,
     in_channels: int | None = None,
-) -> tuple[SuccessorPolicy, dict[str, list[str]]]:
+) -> tuple[JointPolicyValueNet, dict[str, list[str]]]:
     from mycchess_rl.chess import FEATURE_LIST
 
     ckpt = torch_load_checkpoint(checkpoint, device)
@@ -114,12 +117,16 @@ def load_successor_policy_for_play(
         if in_channels is not None
         else ckpt.get("in_channels", ckpt.get("select_in_channels", POLICY_SELECT_IN_CHANNELS))
     )
-    model = SuccessorPolicy(
+    pm = int(ckpt.get("policy_max_legal", POLICY_MAX_LEGAL_MOVES))
+    vs = float(ckpt.get("value_scale", 10.0))
+    model = JointPolicyValueNet(
         num_res_layers=num_res,
         in_channels=in_ch,
         filters=filters,
+        policy_max_legal=pm,
+        value_scale=vs,
     ).to(device)
-    model.load_state_dict(sd, strict=False)
+    model.load_state_dict(sd, strict=True)
     model.eval()
     flist: dict[str, list[str]] = {
         "red": list(FEATURE_LIST["red"]),

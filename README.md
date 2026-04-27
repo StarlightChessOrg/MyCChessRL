@@ -1,6 +1,6 @@
 # MyCChessRL
 
-中国象棋强化学习实践：**规则与合法着法仅通过本地编译的 `xqwl_core`（象棋小巫师 XQWL06 核心）提供**，不依赖 `cchess` 或其它 Python 棋规库。神经网络为 **两阶段 ICCS 策略 + 行棋方三分类价值头**；**根输入 14 路棋子平面**与 [icyElephant](https://github.com/bupticybee/icyElephant) 的 `game_convert.py` / `gameplay.py` 一致（行棋方子类在前，黑方时垂直翻转），而非旧版 MyElephant 式 7+11+47 融合平面。
+中国象棋强化学习实践：**规则与合法着法仅通过本地编译的 `xqwl_core`（象棋小巫师 XQWL06 核心）提供**，不依赖 `cchess` 或其它 Python 棋规库。神经网络为 **`JointPolicyValueNet`：对有序合法着法列表的联合 softmax（槽位宽度见 `POLICY_MAX_LEGAL_MOVES`）+ `tanh` 缩放的标量价值**；**根输入 14 路棋子平面**与 [icyElephant](https://github.com/bupticybee/icyElephant) 的 `game_convert.py` / `gameplay.py` 一致（行棋方子类在前，黑方时垂直翻转），而非旧版 MyElephant 式 7+11+47 融合平面。**与旧「两阶段 src/dst + 三分类价值」权重不兼容，需重新训练。**
 
 ## 依赖
 
@@ -36,8 +36,8 @@ cmake --build . --config Release
 | `cpp/pybind11-master/` | 随仓库自带的 [pybind11](https://github.com/pybind/pybind11) v2.13.6 源码（BSD 许可证，见该目录 `LICENSE`） |
 | `mycchess_rl/xqwl_state.py` | `XqwlGameState`：唯一规则入口 |
 | `mycchess_rl/chess/` | 平面编码（无 cchess） |
-| `mycchess_rl/model.py` | `SuccessorPolicy` 与 checkpoint 加载 |
-| `mycchess_rl/policy_inference.py` | 贪心 / 批采样 / 价值 / PPO 用 `log π` |
+| `mycchess_rl/model.py` | `JointPolicyValueNet` 与 `load_policy_value_for_play` |
+| `mycchess_rl/policy_inference.py` | 贪心 / 批采样 / 价值 / PPO 用 `log π`（合法着法联合分布） |
 | `mycchess_rl/vec_env.py` | 并行环境步进 |
 | `mycchess_rl/train_ppo.py` | PPO 示意训练 |
 | `mycchess_rl/play_web.py` | Sanic 网页对弈 |
@@ -53,7 +53,7 @@ mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 
 训练脚本会按轮打印 **rollout / 优化耗时、样本数、GAE 统计、分项损失、熵、importance ratio、clip 比例、近似 KL、梯度范数、CUDA 显存** 等；`--log-every N` 为每 N 轮打一次，`--log-file` 同步写入文件。`--rollout-log-every`（默认 32）在单轮 rollout 内输出进度，避免首轮长时间无输出。
 
-**中途存盘**：默认 **`--save-dir runs`**，每 **`--save-every`** 轮（默认 **50**）写入 `runs/ppo_upd_000049.pt` 等（完成第 `upd` 轮后，当 `(upd+1)` 整除 `save_every` 时保存）；训练结束再写 **`runs/mycchess_ppo_last.pt`**。`--save-every 0` 则仅写 `last`。checkpoint 内含 `model`、`in_channels`、可选 `update`，与 `--checkpoint` 微调加载格式一致。
+**中途存盘**：默认 **`--save-dir runs`**，每 **`--save-every`** 轮（默认 **50**）写入 `runs/ppo_upd_000049.pt` 等（完成第 `upd` 轮后，当 `(upd+1)` 整除 `save_every` 时保存）；训练结束再写 **`runs/mycchess_ppo_last.pt`**。`--save-every 0` 则仅写 `last`。checkpoint 内含 `model`、`in_channels`、`num_res_layers`、`filters`、`policy_max_legal`、`value_scale`、可选 `update`，与 `--checkpoint` 微调加载格式一致。
 
 **奖励塑形（初期易瞎逛时）**：`--reward-shaping-step`（默认小负数）时间压力；`--reward-shaping-king-prox` 按落点与对方将/帅**接近度**（曼哈顿，归一化到 [0,1]）给微弱奖；`--reward-shaping-check` 在对手**应将**时给奖，并随接近度在 **0.4~1.0** 倍缩放；`--reward-shaping-capture` 为吃子基量，**兵卒=1×**，象士、马、炮、车、将（若出现）权重递增（见 ``vec_env._CAPTURE_MULT``）。将死仍 **+1**。全关：四个参数均 **0**。
 
@@ -67,7 +67,7 @@ mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 
 ## 特征说明
 
-ResNet 茎输入为 **14×10×9**（与 icyElephant 数据管线一致）。icy 原版第二阶段曾用 **15 路**（14 棋子 + 1 路起点掩码）喂第二个卷积塔；本仓库仍用 **单塔 trunk**，仅在全连接 `head_dst` 处拼接起点 one-hot，与 icy 的卷积分塔不完全相同，但**棋盘侧张量**已与 icy 对齐。曾用 **65 通道** 旧权重与当前 `stem_conv` **不兼容**，需重新训练。
+ResNet 茎输入为 **14×10×9**（与 icyElephant 数据管线一致）。策略在 trunk 后接 **`policy_head`（宽度 `policy_max_legal`，与局面「排序后的合法 ICCS 列表」对齐）**；价值为 **`value_fc` → `tanh` × `value_scale`**（默认与训练时 `ret` 裁剪量级一致）。**棋盘侧张量**与 icy 对齐。曾用 **65 通道** 或其它旧 head 的权重与当前结构 **不兼容**，需重新训练。
 
 `mycchess-play-web` 支持 `--workers`（默认 1）；多 worker 时每个进程独立内存，**不宜**与单进程共享会话的用法混用。
 

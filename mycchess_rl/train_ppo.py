@@ -11,13 +11,13 @@ import numpy as np
 import torch
 
 from mycchess_rl.encode_parallel import default_encode_workers
-from mycchess_rl.model import SuccessorPolicy, load_successor_policy_for_play
+from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play
 from mycchess_rl.policy_inference import (
     batched_encode_roots,
-    batched_two_stage_logprob_on_moves,
+    batched_joint_logprob_on_moves,
     batched_value_expectation,
 )
-from mycchess_rl.ppo import PPOConfig, compute_gae, iccs_to_src_dst_onehot, policy_value_loss_step
+from mycchess_rl.ppo import PPOConfig, compute_gae, policy_value_loss_step
 from mycchess_rl.reward_patterns import DEFAULT_TACTIC_SHAPING_COEFF
 from mycchess_rl.vec_env import ParallelXiangqiVecEnv, collect_rollout_step, reset_finished
 
@@ -259,11 +259,11 @@ def main() -> None:
     t_train0 = time.perf_counter()
 
     if args.checkpoint is not None:
-        model, flist = load_successor_policy_for_play(args.checkpoint, device)
+        model, flist = load_policy_value_for_play(args.checkpoint, device)
         model.eval()
         _LOG.info("从 checkpoint 加载: %s", args.checkpoint)
     else:
-        model = SuccessorPolicy().to(device)
+        model = JointPolicyValueNet().to(device)
         from mycchess_rl.chess import FEATURE_LIST
 
         flist = {"red": list(FEATURE_LIST["red"]), "black": list(FEATURE_LIST["black"])}
@@ -463,8 +463,6 @@ def main() -> None:
 
         obs_list: list = []
         mv_list: list[str] = []
-        src_list: list[torch.Tensor] = []
-        dst_list: list[torch.Tensor] = []
         old_v_list: list[float] = []
         adv_list: list[float] = []
         ret_list: list[float] = []
@@ -477,9 +475,6 @@ def main() -> None:
                     continue
                 obs_list.append(g)
                 mv_list.append(mv)
-                oh_s, oh_d = iccs_to_src_dst_onehot(mv, device, torch.float32)
-                src_list.append(oh_s)
-                dst_list.append(oh_d)
                 old_v_list.append(float(val_buf[t, i]))
                 adv_list.append(float(adv[t, i]))
                 ret_list.append(float(ret[t, i]))
@@ -514,7 +509,7 @@ def main() -> None:
                 upd,
                 feat_roll.shape[0],
             )
-            old_lp, src_ok_b, dst_ok_b = batched_two_stage_logprob_on_moves(
+            old_lp, legal_mask_b, action_idx_b = batched_joint_logprob_on_moves(
                 obs_list,
                 mv_list,
                 feat_roll,
@@ -531,12 +526,6 @@ def main() -> None:
             time.perf_counter() - t_opt0,
         )
 
-        src_b = torch.stack(src_list, dim=0)
-        dst_b = torch.stack(dst_list, dim=0)
-        # stack 已拷贝数据；列表里仍挂着数万个小张量，会重复占显存，必须立刻丢掉。
-        src_list.clear()
-        dst_list.clear()
-
         adv_b = torch.clamp(torch.tensor(adv_list, device=device), -5.0, 5.0)
         ret_b = torch.clamp(torch.tensor(ret_list, device=device), -10.0, 10.0)
         old_v = torch.tensor(old_v_list, device=device)
@@ -545,8 +534,8 @@ def main() -> None:
             model,
             opt,
             xb,
-            src_b,
-            dst_b,
+            legal_mask_b,
+            action_idx_b,
             old_lp,
             adv_b,
             ret_b,
@@ -554,10 +543,8 @@ def main() -> None:
             cfg,
             mini_batch_size=int(args.ppo_mini_batch),
             policy_temperature=1.0,
-            src_legal_mask=src_ok_b,
-            dst_legal_mask=dst_ok_b,
         )
-        del xb, src_b, dst_b, old_lp, adv_b, ret_b, old_v, src_ok_b, dst_ok_b
+        del xb, old_lp, adv_b, ret_b, old_v, legal_mask_b, action_idx_b
         obs_list.clear()
         mv_list.clear()
         adv_list.clear()
@@ -601,14 +588,12 @@ def main() -> None:
             )
             _LOG.info(
                 "[ppo] loss total=%.5f policy=%.5f value=%.5f vf_w=%.5f | "
-                "entropy sum=%.4f (src=%.4f dst=%.4f) | ratio mean=%.4f std=%.4f clip_frac=%.4f approx_kl=%.5f",
+                "entropy_joint=%.4f | ratio mean=%.4f std=%.4f clip_frac=%.4f approx_kl=%.5f",
                 m["loss_total"],
                 m["loss_policy"],
                 m["loss_value"],
                 m["loss_vf_weighted"],
                 m["entropy_sum"],
-                m["entropy_src"],
-                m["entropy_dst"],
                 m["ratio_mean"],
                 m["ratio_std"],
                 m["clip_frac"],
@@ -628,6 +613,10 @@ def main() -> None:
                 {
                     "model": model.state_dict(),
                     "in_channels": model.in_channels,
+                    "num_res_layers": model.num_res_layers,
+                    "filters": model.filters,
+                    "policy_max_legal": model.policy_max_legal,
+                    "value_scale": model.value_scale,
                     "update": int(upd),
                 },
                 ckpt,
@@ -639,6 +628,10 @@ def main() -> None:
         {
             "model": model.state_dict(),
             "in_channels": model.in_channels,
+            "num_res_layers": model.num_res_layers,
+            "filters": model.filters,
+            "policy_max_legal": model.policy_max_legal,
+            "value_scale": model.value_scale,
             "update": int(args.updates) - 1,
         },
         out,

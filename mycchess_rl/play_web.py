@@ -3,15 +3,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 import threading
 from pathlib import Path
+
+# 先于 ``mycchess_rl`` 导入：从启动时的当前工作目录加载 ``xqwl_core*.so``（与 ``python mycchess_rl/play_web.py`` 无关，只看 cwd）
+_cwd = str(Path.cwd().resolve())
+if _cwd not in sys.path:
+    sys.path.insert(0, _cwd)
 
 import numpy as np
 import torch
 
 from mycchess_rl.iccs_util import parse_move_squares
 from mycchess_rl.chess.session import GamePlay
-from mycchess_rl.model import load_successor_policy_for_play
+from mycchess_rl.model import load_policy_value_for_play
 from mycchess_rl.policy_inference import infer_greedy_move_string
 
 STRATEGY_HUMAN = "人类"
@@ -387,7 +393,7 @@ def main() -> None:
     args = p.parse_args()
 
     device = _select_device(int(args.gpu))
-    model, flist = load_successor_policy_for_play(args.checkpoint, device)
+    model, flist = load_policy_value_for_play(args.checkpoint, device)
     session = XqwlWebSession(model, device, flist)
 
     app = Sanic("mycchess_rl_play_web")
