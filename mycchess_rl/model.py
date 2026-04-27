@@ -11,11 +11,14 @@ import torch.nn.functional as F
 from mycchess_rl.chess.rationale import POLICY_MAX_LEGAL_MOVES, POLICY_SELECT_IN_CHANNELS
 from mycchess_rl.hierarchical_sl import HIER_PIECE_HEAD_DIM, HIER_SQUARE_HEAD_DIM
 
+# 联合策略头：总可训练量约 30MiB（FP32，4B/参数）；经网格搜索 stem+宽化 Inception 支路得到。
+# 层次化 SL 在同主干上多 7+90+90 路 logits，总权重大约 +0.41MiB；若须严格 <30MiB 可略减 --inc-stem。
+DEFAULT_STEM_CHANNELS: int = 354
 # 每元组：(1×1, 1×1→空间 降维, 空间支输出宽, 1×1→空间→空间 的降维/中间/末宽, 池化后 1×1)
-# 空间支路用 1×3 再接 3×1 代替 3×3（Inception v2/v3 非对称分解）；浅塔 2 个 Inception 模块 + 宽 stem。
+# 空间支路为 1×3→3×1 分解；浅塔 2 个 Inception 模块。
 DEFAULT_INCEPTION_SPECS: tuple[tuple[int, int, int, int, int, int, int], ...] = (
-    (96, 64, 128, 64, 96, 128, 64),
-    (128, 96, 192, 96, 128, 192, 96),
+    (288, 192, 384, 192, 288, 384, 192),
+    (384, 288, 568, 288, 384, 568, 288),
 )
 
 
@@ -126,7 +129,7 @@ class InceptionJointPolicyValueNet(nn.Module):
         self,
         in_channels: int | None = None,
         *,
-        stem_channels: int = 128,
+        stem_channels: int = DEFAULT_STEM_CHANNELS,
         inception_specs: tuple[tuple[int, int, int, int, int, int, int], ...] | None = None,
         policy_max_legal: int | None = None,
         value_scale: float = 10.0,
@@ -173,7 +176,7 @@ class InceptionHierarchicalPolicyValueNet(nn.Module):
         self,
         in_channels: int | None = None,
         *,
-        stem_channels: int = 128,
+        stem_channels: int = DEFAULT_STEM_CHANNELS,
         inception_specs: tuple[tuple[int, int, int, int, int, int, int], ...] | None = None,
         value_scale: float = 10.0,
     ) -> None:
@@ -288,7 +291,7 @@ def load_policy_value_for_play(
     )
     pm = int(ckpt.get("policy_max_legal", POLICY_MAX_LEGAL_MOVES))
     vs = float(ckpt.get("value_scale", 10.0))
-    stem = int(ckpt.get("stem_channels", 128))
+    stem = int(ckpt.get("stem_channels", DEFAULT_STEM_CHANNELS))
     specs = _parse_inception_specs_ckpt(ckpt)
 
     if "policy_head_type.weight" in sd:

@@ -12,6 +12,7 @@ import torch
 
 from mycchess_rl.encode_parallel import default_encode_workers
 from mycchess_rl.model import (
+    DEFAULT_STEM_CHANNELS,
     InceptionJointPolicyValueNet,
     load_policy_value_for_play,
     policy_value_checkpoint_meta,
@@ -176,8 +177,8 @@ def main() -> None:
     p.add_argument(
         "--inc-stem",
         type=int,
-        default=128,
-        help="无 checkpoint 时 Inception 茎通道（与 train_sl --inc-stem 一致）",
+        default=DEFAULT_STEM_CHANNELS,
+        help="无 checkpoint 时 Inception 茎通道（默认与 train_sl 一致，联合策略约 30MiB FP32）",
     )
     args = p.parse_args()
 

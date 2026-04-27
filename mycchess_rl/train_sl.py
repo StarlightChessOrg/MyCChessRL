@@ -36,6 +36,7 @@ except Exception:
 
 from mycchess_rl.encode_parallel import default_encode_workers
 from mycchess_rl.model import (
+    DEFAULT_STEM_CHANNELS,
     InceptionHierarchicalPolicyValueNet,
     InceptionJointPolicyValueNet,
     load_policy_value_for_play,
@@ -326,8 +327,8 @@ def main() -> None:
     p.add_argument(
         "--inc-stem",
         type=int,
-        default=128,
-        help="无 --checkpoint 时 Inception 茎通道（浅宽塔入口宽度）",
+        default=DEFAULT_STEM_CHANNELS,
+        help="无 --checkpoint 时 Inception 茎通道；默认与 model.DEFAULT_STEM_CHANNELS 一致（联合策略权重大约 30MiB FP32）",
     )
     args = p.parse_args()
 
