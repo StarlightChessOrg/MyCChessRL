@@ -432,6 +432,15 @@ def main() -> None:
         raise SystemExit(2)
     if hierarchical_train and ck is not None and not bool(args.hierarchical_policy):
         _LOG.info("checkpoint 为层次化策略（子种→源→目），已自动启用对应数据与三 ACC 记录。")
+    if hierarchical_train:
+        _LOG.info(
+            "层次化 SL：tqdm 每 batch 显示 acc种/acc源/acc目（EMA）；"
+            "每个 epoch 结束会再打一行 **整轮 batch 平均** 三层 ACC + EMA 对照。"
+        )
+    else:
+        _LOG.info(
+            "当前为联合合法槽策略；若需监督「子种→源→目」三层 ACC，请使用 --hierarchical-policy 并配合层次化权重。"
+        )
 
     for g in opt.param_groups:
         g["lr"] = float(args.lr)
@@ -535,6 +544,10 @@ def main() -> None:
             )
             train_bi = 0
             training_started = True
+            h_loss_sum = 0.0
+            h_acc_t_sum = 0.0
+            h_acc_f_sum = 0.0
+            h_acc_2_sum = 0.0
             if hierarchical_train:
                 for x_np, mt_np, tt_np, mf_np, tf_np, m2_np, t2_np, vs_np, hv_np in pbar_tr:
                     train_bi += 1
@@ -566,6 +579,10 @@ def main() -> None:
                         af = float((lf_m.argmax(dim=-1) == tf).float().mean().item())
                         a2 = float((l2_m.argmax(dim=-1) == t2).float().mean().item())
                     raw_l = float(loss.item())
+                    h_loss_sum += float(raw_l)
+                    h_acc_t_sum += at * 100.0
+                    h_acc_f_sum += af * 100.0
+                    h_acc_2_sum += a2 * 100.0
                     exp_loss.update(raw_l)
                     exp_acc_t.update(at * 100.0)
                     exp_acc_f.update(af * 100.0)
@@ -620,18 +637,38 @@ def main() -> None:
 
             el = exp_loss.get()
             if hierarchical_train:
-                eat = exp_acc_t.get()
-                eaf = exp_acc_f.get()
-                ea2 = exp_acc_2.get()
-                if el is not None and eat is not None and eaf is not None and ea2 is not None:
+                if train_bi > 0:
+                    loss_mean = h_loss_sum / train_bi
+                    acc_t_mean = h_acc_t_sum / train_bi
+                    acc_f_mean = h_acc_f_sum / train_bi
+                    acc_2_mean = h_acc_2_sum / train_bi
+                    eat = exp_acc_t.get()
+                    eaf = exp_acc_f.get()
+                    ea2 = exp_acc_2.get()
+                    ema_loss_s = f"{el:.4f}" if el is not None else "n/a"
+                    ema_t_s = f"{eat:.2f}" if eat is not None else "n/a"
+                    ema_f_s = f"{eaf:.2f}" if eaf is not None else "n/a"
+                    ema_2_s = f"{ea2:.2f}" if ea2 is not None else "n/a"
                     _LOG.info(
-                        "epoch %d train 结束 | EMA loss=%s | acc子种%%=%s acc源%%=%s acc目%%=%s | step=%d",
+                        "epoch %d train 结束 | batches=%d | loss_mean=%.4f (EMA_loss=%s) | "
+                        "三层ACC batch均值: 子种=%.2f%% 源格=%.2f%% 目标=%.2f%% | "
+                        "三层ACC EMA: 子种=%s%% 源=%s%% 目=%s%% | step=%d",
                         epoch,
-                        el,
-                        eat,
-                        eaf,
-                        ea2,
+                        train_bi,
+                        loss_mean,
+                        ema_loss_s,
+                        acc_t_mean,
+                        acc_f_mean,
+                        acc_2_mean,
+                        ema_t_s,
+                        ema_f_s,
+                        ema_2_s,
                         global_step,
+                    )
+                else:
+                    _LOG.warning(
+                        "epoch %d train 结束（层次化）但未处理任何 batch，无 ACC 汇总；请检查数据与 batch_size。",
+                        epoch,
                     )
             else:
                 ea = exp_acc.get()
