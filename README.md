@@ -48,18 +48,20 @@ cmake --build . --config Release
 python -m mycchess_rl.train_ppo
 python -m mycchess_rl.train_ppo --log-file runs/ppo.log --log-every 5
 python -m mycchess_rl.train_ppo --save-dir runs --save-every 100
+python -m mycchess_rl.train_ppo --resume --save-dir runs
+python -m mycchess_rl.train_ppo --resume --checkpoint runs/ppo_upd_000499.pt
 mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 ```
 
 训练脚本会按轮打印 **rollout / 优化耗时、样本数、GAE 统计、分项损失、熵、importance ratio、clip 比例、近似 KL、梯度范数、CUDA 显存** 等；`--log-every N` 为每 N 轮打一次，`--log-file` 同步写入文件。`--rollout-log-every`（默认 32）在单轮 rollout 内输出进度，避免首轮长时间无输出。
 
-**中途存盘**：默认 **`--save-dir runs`**，每 **`--save-every`** 轮（默认 **50**）写入 `runs/ppo_upd_000049.pt` 等（完成第 `upd` 轮后，当 `(upd+1)` 整除 `save_every` 时保存）；训练结束再写 **`runs/mycchess_ppo_last.pt`**。`--save-every 0` 则仅写 `last`。checkpoint 内含 `model`、`in_channels`、`num_res_layers`、`filters`、`policy_max_legal`、`value_scale`、可选 `update`，与 `--checkpoint` 微调加载格式一致。
+**中途存盘**：默认 **`--save-dir runs`**，每 **`--save-every`** 轮（默认 **50**）写入 `runs/ppo_upd_000049.pt` 等（**全局** `upd` 编号，完成该轮后当 `(upd+1)` 整除 `save_every` 时保存）；训练结束再写 **`runs/mycchess_ppo_last.pt`**。`--save-every 0` 则仅写 `last`。训练用 checkpoint 另含 **`optimizer`**（Adam）与 **`update`**，供 **`--resume`** 续训：`--resume` 且未指定 `--checkpoint` 时默认读 `save-dir/mycchess_ppo_last.pt`；与 **`--checkpoint path`** 联用则从该文件恢复权重与优化器。仅推理/微调可不设 `--resume`，此时只读 `model` 等字段，从日志轮次 0 起算。
 
 **奖励塑形**：仅两项（**0=关闭该项**）。`--reward-shaping-king`：非终局鼓励落点靠近对方将/帅（接近度 ``prox∈[0,1]``）；若走后对方被应将，再叠加 ``(0.4+0.6·prox)`` 乘同一系数。`--reward-shaping-capture`：吃子时基量 × 子种相对权重（兵卒=1，象士、马、炮、车、将递增，见 ``vec_env`` 内 ``_CAPTURE_MULT``）。将死仍 **+1**；和棋等终局非将死为 **0**。两项全 **0** 时只有稀疏终局奖。
 
 **数据准备 / GPU 占用**：14 路根平面编码计算量很小，**默认 `--encode-backend inline`**（主进程批量 numpy + **一次** H2D），避免 rollout 每步两次大批编码时 **进程池 pickle/IPC** 反压 GPU（表现为 `nvidia-smi` 利用率低、编码 worker 进程 CPU 也低）。可选 `--encode-backend thread` 或 `process`，并配合 `--encode-workers`。**`--rollout-pipeline-groups`**（默认 2）：采样与价值前向在编码阶段把局面拆成两半，主线程与守护线程各编一半再拼批、一次 `trunk`（`eval()` 下与整批一致），叠合 CPU 准备空档；设为 **1** 关闭。rollout 每步仍有 **策略 + 价值** 两次 trunk（状态不同）。若 GPU 仍低，可增大 `--n-env` 或尝试 `torch.compile` 等。
 
-默认训练超参面向 **约 24 核 CPU、64GB 内存、单卡 A100 40GB**（例如 `--n-env 384 --steps 192 --updates 800`）；价值估计与 rollout 旧对数概率均尽量 **批前向** 以提高 GPU 利用率。优化阶段若整批前向（样本数 ≈ `n_env × steps`）会占满激活显存，可用 **`--ppo-mini-batch`**（默认 4096）按小批 **梯度累积** 做 PPO 反向，峰值显存随该值近似线性变化；仍 OOM 时再调小 `--ppo-mini-batch`、`--n-env` 或 `--steps`。
+默认训练超参面向 **约 24 核 CPU、64GB 内存、单卡 A100 40GB**（例如 `--n-env 384 --steps 192`；`--updates` 默认 **100000**，可手动 Ctrl+C 早停）；价值估计与 rollout 旧对数概率均尽量 **批前向** 以提高 GPU 利用率。优化阶段若整批前向（样本数 ≈ `n_env × steps`）会占满激活显存，可用 **`--ppo-mini-batch`**（默认 4096）按小批 **梯度累积** 做 PPO 反向，峰值显存随该值近似线性变化；仍 OOM 时再调小 `--ppo-mini-batch`、`--n-env` 或 `--steps`。
 
 训练日志里的 **torch_reserved** 多为 CUDA 分配器缓存（首轮大包峰值后常明显高于 **torch_alloc**），一般不是显存泄漏；每轮结束后脚本会 `del` 大张量并默认 `torch.cuda.empty_cache()`（可用 `--no-cuda-empty-cache-each-update` 关闭）。碎片严重时可试环境变量 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
 

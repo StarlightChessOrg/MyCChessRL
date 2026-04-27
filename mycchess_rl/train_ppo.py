@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from mycchess_rl.encode_parallel import default_encode_workers
-from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play
+from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play, torch_load_checkpoint
 from mycchess_rl.policy_inference import (
     batched_encode_roots,
     batched_joint_logprob_on_moves,
@@ -68,11 +68,22 @@ def main() -> None:
     p.add_argument(
         "--updates",
         type=int,
-        default=800,
-        help="PPO 更新轮数（单机强 GPU 可拉长总训练）",
+        default=100_000,
+        help="本轮要跑的 PPO 更新次数（续训时在已有全局 update 之后再跑这么多次；默认很大；Ctrl+C 仍会写 last）",
     )
     p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--checkpoint", type=Path, default=None, help="从已有权重微调；省略则随机初始化")
+    p.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="权重路径：默认仅加载 model，训练从 update=0 起；与 --resume 联用则另恢复 Adam 与全局轮次",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="续训：与 --checkpoint 指向训练存盘（含 optimizer 为佳），或省略 checkpoint 时用 --save-dir 下 mycchess_ppo_last.pt；"
+        "全局轮次从文件中 update+1 继续；本轮仍执行 --updates 次",
+    )
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument(
         "--log-every",
@@ -167,11 +178,23 @@ def main() -> None:
 
     t_train0 = time.perf_counter()
 
+    ckpt_path_model: Path | None = None
     if args.checkpoint is not None:
-        model, flist = load_policy_value_for_play(args.checkpoint, device)
+        ckpt_path_model = Path(args.checkpoint)
+    elif args.resume:
+        ckpt_path_model = save_dir / "mycchess_ppo_last.pt"
+
+    if ckpt_path_model is not None:
+        if not ckpt_path_model.is_file():
+            _LOG.error("找不到 checkpoint: %s", ckpt_path_model.resolve())
+            raise SystemExit(2)
+        model, flist = load_policy_value_for_play(ckpt_path_model, device)
         model.eval()
-        _LOG.info("从 checkpoint 加载: %s", args.checkpoint)
+        _LOG.info("从 checkpoint 加载 model: %s", ckpt_path_model.resolve())
     else:
+        if args.resume:
+            _LOG.error("--resume 需要 --checkpoint，或先有 %s", (save_dir / "mycchess_ppo_last.pt").resolve())
+            raise SystemExit(2)
         model = JointPolicyValueNet().to(device)
         from mycchess_rl.chess import FEATURE_LIST
 
@@ -213,6 +236,28 @@ def main() -> None:
 
     cfg = PPOConfig(lr=args.lr)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+
+    start_global = 0
+    if args.resume:
+        assert ckpt_path_model is not None
+        raw = torch_load_checkpoint(ckpt_path_model, device)
+        if "optimizer" in raw:
+            try:
+                opt.load_state_dict(raw["optimizer"])
+                _LOG.info("已恢复 Adam 状态（含一阶/二阶矩缓冲）")
+            except Exception as e:
+                _LOG.warning("优化器状态与当前模型或设备不兼容，已忽略（按新 Adam 累积）: %s", e)
+        else:
+            _LOG.warning("checkpoint 中无 optimizer 字段，续训仅继承权重，Adam 从新开始")
+        last_u = int(raw.get("update", -1))
+        start_global = last_u + 1
+        if start_global < 0:
+            start_global = 0
+        _LOG.info("续训：下一档全局 update=%d（文件中最后一档已完成=%d）", start_global, last_u)
+
+    for g in opt.param_groups:
+        g["lr"] = float(args.lr)
+
     vec = ParallelXiangqiVecEnv(args.n_env)
     vec.reset_all()
 
@@ -222,62 +267,45 @@ def main() -> None:
     log_every = max(1, int(args.log_every))
     roll_log = int(args.rollout_log_every)
 
-    for upd in range(args.updates):
-        t_upd0 = time.perf_counter()
-        _LOG.info(
-            "[ppo] update %d/%d 开始 | rollout 共 %d 步 × %d 环境",
-            upd,
-            args.updates,
-            T,
-            N,
-        )
-        obs_buf: list[list[object]] = [[None] * N for _ in range(T)]
-        act_buf = np.empty((T, N), dtype=object)
-        rew_buf = np.zeros((T, N), dtype=np.float32)
-        done_buf = np.zeros((T, N), dtype=np.bool_)
-        val_buf = np.zeros((T, N), dtype=np.float32)
+    last_finished_update: int | None = None
+    interrupted = False
 
-        t_roll0 = time.perf_counter()
-        with torch.no_grad():
-            v_cur = batched_value_expectation(
-                [s.game for s in vec.slots],
-                model,
-                device,
-                flist,
-                encode_workers=enc_w,
-                encode_backend=enc_be,
-                rollout_pipeline_groups=rp_groups,
+    def _training_checkpoint_dict(finished_upd: int) -> dict:
+        return {
+            "model": model.state_dict(),
+            "in_channels": model.in_channels,
+            "num_res_layers": model.num_res_layers,
+            "filters": model.filters,
+            "policy_max_legal": model.policy_max_legal,
+            "value_scale": model.value_scale,
+            "update": int(finished_upd),
+            "optimizer": opt.state_dict(),
+        }
+
+    def _save_last_checkpoint(finished_upd: int) -> Path:
+        out_p = save_dir / "mycchess_ppo_last.pt"
+        torch.save(_training_checkpoint_dict(finished_upd), out_p)
+        return out_p
+
+    try:
+        for k in range(args.updates):
+            upd = start_global + k
+            t_upd0 = time.perf_counter()
+            _LOG.info(
+                "[ppo] update %d 开始 | 本轮 %d/%d | rollout 共 %d 步 × %d 环境",
+                upd,
+                k + 1,
+                args.updates,
+                T,
+                N,
             )
-            v_cur = v_cur.detach().float().cpu().numpy()
+            obs_buf: list[list[object]] = [[None] * N for _ in range(T)]
+            act_buf = np.empty((T, N), dtype=object)
+            rew_buf = np.zeros((T, N), dtype=np.float32)
+            done_buf = np.zeros((T, N), dtype=np.bool_)
+            val_buf = np.zeros((T, N), dtype=np.float32)
 
-        n_done_rollout = 0
-        mean_abs_rew = 0.0
-
-        for t in range(T):
-            gps_pre = [s.game for s in vec.slots]
-            for i in range(N):
-                obs_buf[t][i] = gps_pre[i]
-            val_buf[t] = v_cur
-
-            rew, done, _, moves = collect_rollout_step(
-                vec,
-                model,
-                device,
-                flist,
-                policy_temperature=1.0,
-                generator=gen,
-                encode_workers=enc_w,
-                encode_backend=enc_be,
-                rollout_pipeline_groups=rp_groups,
-                reward_shaping_capture=rs_cap,
-                reward_shaping_king=rs_king,
-            )
-            act_buf[t, :] = moves
-            rew_buf[t] = rew
-            done_buf[t] = done
-            n_done_rollout += int(done.sum())
-            mean_abs_rew += float(np.abs(rew).sum())
-
+            t_roll0 = time.perf_counter()
             with torch.no_grad():
                 v_cur = batched_value_expectation(
                     [s.game for s in vec.slots],
@@ -289,214 +317,249 @@ def main() -> None:
                     rollout_pipeline_groups=rp_groups,
                 )
                 v_cur = v_cur.detach().float().cpu().numpy()
-            reset_finished(vec, done)
 
-            if roll_log > 0 and (t + 1) % roll_log == 0:
-                _LOG.info(
-                    "[ppo] update %d rollout 进度 %d/%d (%.0f%%) elapsed=%.1fs",
-                    upd,
-                    t + 1,
-                    T,
-                    100.0 * (t + 1) / T,
-                    time.perf_counter() - t_roll0,
+            n_done_rollout = 0
+            mean_abs_rew = 0.0
+
+            for t in range(T):
+                gps_pre = [s.game for s in vec.slots]
+                for i in range(N):
+                    obs_buf[t][i] = gps_pre[i]
+                val_buf[t] = v_cur
+
+                rew, done, _, moves = collect_rollout_step(
+                    vec,
+                    model,
+                    device,
+                    flist,
+                    policy_temperature=1.0,
+                    generator=gen,
+                    encode_workers=enc_w,
+                    encode_backend=enc_be,
+                    rollout_pipeline_groups=rp_groups,
+                    reward_shaping_capture=rs_cap,
+                    reward_shaping_king=rs_king,
                 )
+                act_buf[t, :] = moves
+                rew_buf[t] = rew
+                done_buf[t] = done
+                n_done_rollout += int(done.sum())
+                mean_abs_rew += float(np.abs(rew).sum())
 
-        t_roll1 = time.perf_counter()
-        rollout_s = t_roll1 - t_roll0
+                with torch.no_grad():
+                    v_cur = batched_value_expectation(
+                        [s.game for s in vec.slots],
+                        model,
+                        device,
+                        flist,
+                        encode_workers=enc_w,
+                        encode_backend=enc_be,
+                        rollout_pipeline_groups=rp_groups,
+                    )
+                    v_cur = v_cur.detach().float().cpu().numpy()
+                reset_finished(vec, done)
 
-        with torch.no_grad():
-            last_v = batched_value_expectation(
-                [s.game for s in vec.slots],
-                model,
-                device,
+                if roll_log > 0 and (t + 1) % roll_log == 0:
+                    _LOG.info(
+                        "[ppo] update %d rollout 进度 %d/%d (%.0f%%) elapsed=%.1fs",
+                        upd,
+                        t + 1,
+                        T,
+                        100.0 * (t + 1) / T,
+                        time.perf_counter() - t_roll0,
+                    )
+
+            t_roll1 = time.perf_counter()
+            rollout_s = t_roll1 - t_roll0
+
+            with torch.no_grad():
+                last_v = batched_value_expectation(
+                    [s.game for s in vec.slots],
+                    model,
+                    device,
+                    flist,
+                    encode_workers=enc_w,
+                    encode_backend=enc_be,
+                    rollout_pipeline_groups=rp_groups,
+                )
+                last_v = last_v.detach().float().cpu().numpy()
+            adv, ret = compute_gae(rew_buf, val_buf, done_buf, last_v, gamma=cfg.gamma, lam=cfg.gae_lambda)
+            adv_mean_b, adv_std_b = float(adv.mean()), float(adv.std())
+            ret_mean_b, ret_std_b = float(ret.mean()), float(ret.std())
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+            obs_list: list = []
+            mv_list: list[str] = []
+            old_v_list: list[float] = []
+            adv_list: list[float] = []
+            ret_list: list[float] = []
+
+            for t in range(T):
+                for i in range(N):
+                    g = obs_buf[t][i]
+                    mv = act_buf[t, i]
+                    if not isinstance(mv, str) or len(mv) < 5:
+                        continue
+                    obs_list.append(g)
+                    mv_list.append(mv)
+                    old_v_list.append(float(val_buf[t, i]))
+                    adv_list.append(float(adv[t, i]))
+                    ret_list.append(float(ret[t, i]))
+
+            slots_total = T * N
+            n_skipped = slots_total - len(obs_list)
+            if not obs_list:
+                _LOG.warning("update=%d 无有效样本（全部被跳过），跳过优化", upd)
+                continue
+
+            n_opt_samples = len(obs_list)
+
+            t_opt0 = time.perf_counter()
+            _LOG.info(
+                "[ppo] update %d 优化阶段 | 有效样本=%d / slots=%d | 编码+batch trunk...",
+                upd,
+                len(obs_list),
+                slots_total,
+            )
+            xb = batched_encode_roots(
+                obs_list,
                 flist,
+                device,
                 encode_workers=enc_w,
                 encode_backend=enc_be,
-                rollout_pipeline_groups=rp_groups,
             )
-            last_v = last_v.detach().float().cpu().numpy()
-        adv, ret = compute_gae(rew_buf, val_buf, done_buf, last_v, gamma=cfg.gamma, lam=cfg.gae_lambda)
-        adv_mean_b, adv_std_b = float(adv.mean()), float(adv.std())
-        ret_mean_b, ret_std_b = float(ret.mean()), float(ret.std())
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-        obs_list: list = []
-        mv_list: list[str] = []
-        old_v_list: list[float] = []
-        adv_list: list[float] = []
-        ret_list: list[float] = []
-
-        for t in range(T):
-            for i in range(N):
-                g = obs_buf[t][i]
-                mv = act_buf[t, i]
-                if not isinstance(mv, str) or len(mv) < 5:
-                    continue
-                obs_list.append(g)
-                mv_list.append(mv)
-                old_v_list.append(float(val_buf[t, i]))
-                adv_list.append(float(adv[t, i]))
-                ret_list.append(float(ret[t, i]))
-
-        slots_total = T * N
-        n_skipped = slots_total - len(obs_list)
-        if not obs_list:
-            _LOG.warning("update=%d 无有效样本（全部被跳过），跳过优化", upd)
-            continue
-
-        n_opt_samples = len(obs_list)
-
-        t_opt0 = time.perf_counter()
-        _LOG.info(
-            "[ppo] update %d 优化阶段 | 有效样本=%d / slots=%d | 编码+batch trunk...",
-            upd,
-            len(obs_list),
-            slots_total,
-        )
-        xb = batched_encode_roots(
-            obs_list,
-            flist,
-            device,
-            encode_workers=enc_w,
-            encode_backend=enc_be,
-        )
-        with torch.no_grad():
-            model.eval()
-            feat_roll = model._trunk_flat(xb)
+            with torch.no_grad():
+                model.eval()
+                feat_roll = model._trunk_flat(xb)
+                _LOG.info(
+                    "[ppo] update %d 计算 old_logp（整批 head，样本数=%d）...",
+                    upd,
+                    feat_roll.shape[0],
+                )
+                old_lp, legal_mask_b, action_idx_b = batched_joint_logprob_on_moves(
+                    obs_list,
+                    mv_list,
+                    feat_roll,
+                    model,
+                    device,
+                    policy_temperature=1.0,
+                )
+                del feat_roll
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
             _LOG.info(
-                "[ppo] update %d 计算 old_logp（整批 head，样本数=%d）...",
+                "[ppo] update %d old_logp 完成 elapsed=%.2fs，开始反向更新",
                 upd,
-                feat_roll.shape[0],
+                time.perf_counter() - t_opt0,
             )
-            old_lp, legal_mask_b, action_idx_b = batched_joint_logprob_on_moves(
-                obs_list,
-                mv_list,
-                feat_roll,
+
+            adv_b = torch.clamp(torch.tensor(adv_list, device=device), -5.0, 5.0)
+            ret_b = torch.clamp(torch.tensor(ret_list, device=device), -10.0, 10.0)
+            old_v = torch.tensor(old_v_list, device=device)
+
+            loss, m = policy_value_loss_step(
                 model,
-                device,
+                opt,
+                xb,
+                legal_mask_b,
+                action_idx_b,
+                old_lp,
+                adv_b,
+                ret_b,
+                old_v,
+                cfg,
+                mini_batch_size=int(args.ppo_mini_batch),
                 policy_temperature=1.0,
             )
-            del feat_roll
-            if device.type == "cuda":
+            del xb, old_lp, adv_b, ret_b, old_v, legal_mask_b, action_idx_b
+            obs_list.clear()
+            mv_list.clear()
+            adv_list.clear()
+            ret_list.clear()
+            old_v_list.clear()
+            if device.type == "cuda" and bool(getattr(args, "cuda_empty_cache_each_update", True)):
                 torch.cuda.empty_cache()
-        _LOG.info(
-            "[ppo] update %d old_logp 完成 elapsed=%.2fs，开始反向更新",
-            upd,
-            time.perf_counter() - t_opt0,
-        )
 
-        adv_b = torch.clamp(torch.tensor(adv_list, device=device), -5.0, 5.0)
-        ret_b = torch.clamp(torch.tensor(ret_list, device=device), -10.0, 10.0)
-        old_v = torch.tensor(old_v_list, device=device)
+            t_opt1 = time.perf_counter()
+            optimize_s = t_opt1 - t_opt0
+            upd_s = time.perf_counter() - t_upd0
 
-        loss, m = policy_value_loss_step(
-            model,
-            opt,
-            xb,
-            legal_mask_b,
-            action_idx_b,
-            old_lp,
-            adv_b,
-            ret_b,
-            old_v,
-            cfg,
-            mini_batch_size=int(args.ppo_mini_batch),
-            policy_temperature=1.0,
-        )
-        del xb, old_lp, adv_b, ret_b, old_v, legal_mask_b, action_idx_b
-        obs_list.clear()
-        mv_list.clear()
-        adv_list.clear()
-        ret_list.clear()
-        old_v_list.clear()
-        if device.type == "cuda" and bool(getattr(args, "cuda_empty_cache_each_update", True)):
-            torch.cuda.empty_cache()
+            if upd % log_every == 0:
+                mem = _cuda_mem_mb(device)
+                _LOG.info(
+                    "[ppo] update %d | 本轮 %d/%d | wall_rollout=%.2fs wall_opt=%.2fs wall_total=%.2fs | "
+                    "slots=%d samples=%d skipped=%d done_flags=%d mean|rew|_per_slot=%.4f",
+                    upd,
+                    k + 1,
+                    args.updates,
+                    rollout_s,
+                    optimize_s,
+                    upd_s,
+                    slots_total,
+                    n_opt_samples,
+                    n_skipped,
+                    n_done_rollout,
+                    mean_abs_rew / max(slots_total, 1),
+                )
+                _LOG.info(
+                    "[ppo] gae(before_norm) mean_adv=%.4f std_adv=%.4f mean_ret=%.4f std_ret=%.4f | "
+                    "clip=%.3f gamma=%.4f gae_lambda=%.4f vf_coef=%.3f ent_coef=%.4f",
+                    adv_mean_b,
+                    adv_std_b,
+                    ret_mean_b,
+                    ret_std_b,
+                    cfg.clip_eps,
+                    cfg.gamma,
+                    cfg.gae_lambda,
+                    cfg.vf_coef,
+                    cfg.ent_coef,
+                )
+                _LOG.info(
+                    "[ppo] loss total=%.5f policy=%.5f value=%.5f vf_w=%.5f | "
+                    "entropy_joint=%.4f | ratio mean=%.4f std=%.4f clip_frac=%.4f approx_kl=%.5f",
+                    m["loss_total"],
+                    m["loss_policy"],
+                    m["loss_value"],
+                    m["loss_vf_weighted"],
+                    m["entropy_sum"],
+                    m["ratio_mean"],
+                    m["ratio_std"],
+                    m["clip_frac"],
+                    m["approx_kl"],
+                )
+                _LOG.info(
+                    "[ppo] value batch: v_pred_mean=%.4f old_v_mean=%.4f | grad_norm=%.4f | %s",
+                    m["v_pred_mean"],
+                    m["old_v_mean"],
+                    m["grad_norm"],
+                    mem,
+                )
 
-        t_opt1 = time.perf_counter()
-        optimize_s = t_opt1 - t_opt0
-        upd_s = time.perf_counter() - t_upd0
+            last_finished_update = upd
 
-        if upd % log_every == 0:
-            mem = _cuda_mem_mb(device)
-            _LOG.info(
-                "[ppo] update %d/%d | wall_rollout=%.2fs wall_opt=%.2fs wall_total=%.2fs | "
-                "slots=%d samples=%d skipped=%d done_flags=%d mean|rew|_per_slot=%.4f",
-                upd,
-                args.updates,
-                rollout_s,
-                optimize_s,
-                upd_s,
-                slots_total,
-                n_opt_samples,
-                n_skipped,
-                n_done_rollout,
-                mean_abs_rew / max(slots_total, 1),
-            )
-            _LOG.info(
-                "[ppo] gae(before_norm) mean_adv=%.4f std_adv=%.4f mean_ret=%.4f std_ret=%.4f | "
-                "clip=%.3f gamma=%.4f gae_lambda=%.4f vf_coef=%.3f ent_coef=%.4f",
-                adv_mean_b,
-                adv_std_b,
-                ret_mean_b,
-                ret_std_b,
-                cfg.clip_eps,
-                cfg.gamma,
-                cfg.gae_lambda,
-                cfg.vf_coef,
-                cfg.ent_coef,
-            )
-            _LOG.info(
-                "[ppo] loss total=%.5f policy=%.5f value=%.5f vf_w=%.5f | "
-                "entropy_joint=%.4f | ratio mean=%.4f std=%.4f clip_frac=%.4f approx_kl=%.5f",
-                m["loss_total"],
-                m["loss_policy"],
-                m["loss_value"],
-                m["loss_vf_weighted"],
-                m["entropy_sum"],
-                m["ratio_mean"],
-                m["ratio_std"],
-                m["clip_frac"],
-                m["approx_kl"],
-            )
-            _LOG.info(
-                "[ppo] value batch: v_pred_mean=%.4f old_v_mean=%.4f | grad_norm=%.4f | %s",
-                m["v_pred_mean"],
-                m["old_v_mean"],
-                m["grad_norm"],
-                mem,
-            )
+            if save_every > 0 and (upd + 1) % save_every == 0:
+                ckpt = save_dir / f"ppo_upd_{upd:06d}.pt"
+                torch.save(_training_checkpoint_dict(upd), ckpt)
+                _LOG.info("已保存中途 checkpoint update=%d -> %s", upd, ckpt)
 
-        if save_every > 0 and (upd + 1) % save_every == 0:
-            ckpt = save_dir / f"ppo_upd_{upd:06d}.pt"
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "in_channels": model.in_channels,
-                    "num_res_layers": model.num_res_layers,
-                    "filters": model.filters,
-                    "policy_max_legal": model.policy_max_legal,
-                    "value_scale": model.value_scale,
-                    "update": int(upd),
-                },
-                ckpt,
-            )
-            _LOG.info("已保存中途 checkpoint update=%d -> %s", upd, ckpt)
-
-    out = save_dir / "mycchess_ppo_last.pt"
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "in_channels": model.in_channels,
-            "num_res_layers": model.num_res_layers,
-            "filters": model.filters,
-            "policy_max_legal": model.policy_max_legal,
-            "value_scale": model.value_scale,
-            "update": int(args.updates) - 1,
-        },
-        out,
-    )
-    total_s = time.perf_counter() - t_train0
-    _LOG.info("训练结束 wall_total=%.1fs | 已保存 %s", total_s, out)
+    except KeyboardInterrupt:
+        interrupted = True
+        _LOG.warning("收到 Ctrl+C，中止训练（保留上一轮已完成的权重）")
+    finally:
+        total_s = time.perf_counter() - t_train0
+        if last_finished_update is not None:
+            out = _save_last_checkpoint(last_finished_update)
+            if interrupted:
+                _LOG.info(
+                    "已保存中断点权重 wall_total=%.1fs | %s (update=%d)",
+                    total_s,
+                    out,
+                    last_finished_update,
+                )
+            else:
+                _LOG.info("训练结束 wall_total=%.1fs | 已保存 %s", total_s, out)
+        else:
+            _LOG.warning("尚未完成任一整轮 PPO 更新，未写入 mycchess_ppo_last.pt | wall_total=%.1fs", total_s)
 
 
 if __name__ == "__main__":
