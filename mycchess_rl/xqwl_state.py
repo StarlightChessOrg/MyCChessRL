@@ -76,7 +76,9 @@ class XqwlGameState:
     def board_view(self) -> np.ndarray:
         """(10,9) 与 ``encode_model_planes`` 使用的红下视角一致。"""
         board, _ = parse_fen_board(self.pos.fen())
-        return np.flip(board, axis=0).astype("<U1", copy=False)
+        # 独立分配，避免 flip/astype 视图与 UCS 缓冲在大量调用下触发异常释放路径
+        flipped = np.flip(np.asarray(board), axis=0)
+        return np.array(flipped, dtype="<U1", copy=True)
 
     def terminal(self) -> tuple[bool, str]:
         k = int(self.pos.terminal_kind())

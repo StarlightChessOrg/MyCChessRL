@@ -4,8 +4,15 @@
 """
 from __future__ import annotations
 
+import os
+
+# 须在 import numpy/torch 之前：OpenBLAS/MKL 常在库初始化时读取线程环境变量
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import argparse
-import gc
 import logging
 import random
 import sys
@@ -16,6 +23,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+try:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
+
 from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play, torch_load_checkpoint
 from mycchess_rl.sl_data import (
     discover_cbf_files,
@@ -25,6 +38,23 @@ from mycchess_rl.sl_data import (
 )
 
 _LOG = logging.getLogger("mycchess_rl.train_sl")
+
+
+def _batch_tensors_to_device(
+    x_np: np.ndarray,
+    m_np: np.ndarray,
+    yi_np: np.ndarray,
+    vs_np: np.ndarray,
+    hv_np: np.ndarray,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """从 NumPy 拷入新张量，避免 ``from_numpy`` 与底层缓冲生命周期/CUDA 异步交互导致堆损坏。"""
+    x = torch.tensor(np.ascontiguousarray(x_np), dtype=torch.float32, device=device)
+    mask = torch.tensor(np.ascontiguousarray(m_np), dtype=torch.bool, device=device)
+    tgt = torch.tensor(np.ascontiguousarray(yi_np.astype(np.int64, copy=False)), dtype=torch.long, device=device)
+    v_sign = torch.tensor(np.ascontiguousarray(vs_np), dtype=torch.float32, device=device)
+    has_v = torch.tensor(np.ascontiguousarray(hv_np), dtype=torch.bool, device=device)
+    return x, mask, tgt, v_sign, has_v
 
 
 def _setup_logging(log_file: Path | None) -> None:
@@ -238,11 +268,9 @@ def main() -> None:
                 train_gen, int(args.batch_size)
             )
 
-            x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device)
-            mask = torch.from_numpy(np.ascontiguousarray(m_np)).to(device)
-            tgt = torch.from_numpy(np.ascontiguousarray(yi_np.astype(np.int64))).to(device)
-            v_sign = torch.from_numpy(np.ascontiguousarray(vs_np)).to(device)
-            has_v = torch.from_numpy(np.ascontiguousarray(hv_np)).to(device)
+            x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(
+                x_np, m_np, yi_np, vs_np, hv_np, device
+            )
 
             opt.zero_grad(set_to_none=True)
             logits_m, v_pred = model(x)
@@ -289,11 +317,9 @@ def main() -> None:
                 x_np, m_np, yi_np, vs_np, hv_np = next_collated_batch(
                     val_gen, int(args.batch_size)
                 )
-                x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device)
-                mask = torch.from_numpy(np.ascontiguousarray(m_np)).to(device)
-                tgt = torch.from_numpy(np.ascontiguousarray(yi_np.astype(np.int64))).to(device)
-                v_sign = torch.from_numpy(np.ascontiguousarray(vs_np)).to(device)
-                has_v = torch.from_numpy(np.ascontiguousarray(hv_np)).to(device)
+                x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(
+                    x_np, m_np, yi_np, vs_np, hv_np, device
+                )
                 logits_m, v_pred = model(x)
                 logits_masked = logits_m.masked_fill(~mask, -1e9)
                 loss_p = F.cross_entropy(logits_masked, tgt)
@@ -318,10 +344,6 @@ def main() -> None:
 
         last = save_dir / "last.pt"
         _save_ckpt(last, model, opt, epoch=epoch, global_step=global_step, best_val=best_val)
-
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     dt = time.perf_counter() - t0
     _LOG.info("监督训练结束 wall=%.1fs | best_val_loss=%.4f | last=%s", dt, best_val, (save_dir / "last.pt").resolve())

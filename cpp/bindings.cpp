@@ -97,12 +97,16 @@ struct XQWLPosition {
   std::vector<int> legal_moves_mv() const {
     int mvs[MAX_GEN_MOVES];
     int n = pos.GenerateMoves(mvs, FALSE);
+    if (n > MAX_GEN_MOVES) {
+      n = MAX_GEN_MOVES;
+    }
     std::vector<int> out;
     out.reserve(static_cast<size_t>(n));
-    PositionStruct &mut = const_cast<PositionStruct &>(pos);
+    // 必须在局面副本上试走：在 const 方法里 const_cast 原地 MakeMove/Undo
+    // 若与 Python 侧 fen()/其它调用交错或引擎内部边界情况，会污染真实 pos，表现为随机堆损坏 / double free。
     for (int i = 0; i < n; ++i) {
-      if (mut.MakeMove(mvs[i])) {
-        mut.UndoMakeMove();
+      PositionStruct trial = pos;
+      if (trial.MakeMove(mvs[i])) {
         out.push_back(mvs[i]);
       }
     }
@@ -137,7 +141,10 @@ struct XQWLPosition {
 
   int ply_count() const { return pos.nMoveNum; }
 
-  bool is_mate() const { return const_cast<PositionStruct &>(pos).IsMate(); }
+  bool is_mate() const {
+    PositionStruct trial = pos;
+    return trial.IsMate() != 0;
+  }
 
   int terminal_kind() const {
     if (is_mate())

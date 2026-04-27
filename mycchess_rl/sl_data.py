@@ -122,57 +122,62 @@ def iter_joint_sl_samples_from_cbf(
     在 **标准起始 FEN** 上逐步回放一局；每步 yield 走子**前**的样本。
     解析路径与 MyElephant ``convert_game`` / icyElephant 棋谱结构一致（``xmltodict``）。
     """
+    doc: dict[str, Any] | None = None
     try:
-        doc = _load_cbf_dict(path)
-    except Exception:
-        return
-    rec = doc.get("ChineseChessRecord")
-    if not isinstance(rec, dict):
-        return
-    head = rec.get("Head")
-    if not isinstance(head, dict):
-        return
-    fen = _xml_text(head.get("FEN"))
-    if not _fen_matches_standard_start(fen):
-        return
-    red_cls = red_outcome_class_from_head_dict(head)
-    ml = rec.get("MoveList") or {}
-    moves_raw = ml.get("Move")
-    moves = [
-        str(m["@value"])
-        for m in _normalize_move_entries(moves_raw)
-        if m.get("@value") not in (None, "00-00")
-    ]
-    st = XqwlGameState()
-    st.reset()
-    for mv in moves:
-        legs = sorted(st.legal_moves_iccs_str())
-        if not legs:
+        try:
+            doc = _load_cbf_dict(path)
+        except Exception:
             return
-        if mv not in legs:
+        rec = doc.get("ChineseChessRecord")
+        if not isinstance(rec, dict):
             return
-        if len(legs) > policy_max_legal:
-            raise ValueError(
-                f"合法着法数 {len(legs)} 超过 policy_max_legal={policy_max_legal} file={path!r}"
-            )
-        mask = np.zeros((policy_max_legal,), dtype=np.bool_)
-        mask[: len(legs)] = True
-        idx = int(legs.index(mv))
-        chw = np.array(encode_states_inline([st])[0], dtype=np.float32, copy=True)
-        stm_cls = int(stm_outcome_class_from_red_outcome(red_cls, bool(st.red_to_move)))
-        if stm_cls == VALUE_LABEL_IGNORE:
-            has_v = False
-            vs = np.float32(0.0)
-        else:
-            has_v = True
-            if stm_cls == STM_OUTCOME_WIN:
-                vs = np.float32(1.0)
-            elif stm_cls == STM_OUTCOME_LOSS:
-                vs = np.float32(-1.0)
-            else:
+        head = rec.get("Head")
+        if not isinstance(head, dict):
+            return
+        fen = _xml_text(head.get("FEN"))
+        if not _fen_matches_standard_start(fen):
+            return
+        red_cls = red_outcome_class_from_head_dict(head)
+        ml = rec.get("MoveList") or {}
+        moves_raw = ml.get("Move")
+        moves = [
+            str(m["@value"])
+            for m in _normalize_move_entries(moves_raw)
+            if m.get("@value") not in (None, "00-00")
+        ]
+        st = XqwlGameState()
+        st.reset()
+        for mv in moves:
+            legs = sorted(st.legal_moves_iccs_str())
+            if not legs:
+                return
+            if mv not in legs:
+                return
+            if len(legs) > policy_max_legal:
+                raise ValueError(
+                    f"合法着法数 {len(legs)} 超过 policy_max_legal={policy_max_legal} file={path!r}"
+                )
+            mask = np.zeros((policy_max_legal,), dtype=np.bool_)
+            mask[: len(legs)] = True
+            idx = int(legs.index(mv))
+            chw = np.array(encode_states_inline([st])[0], dtype=np.float32, copy=True)
+            stm_cls = int(stm_outcome_class_from_red_outcome(red_cls, bool(st.red_to_move)))
+            if stm_cls == VALUE_LABEL_IGNORE:
+                has_v = False
                 vs = np.float32(0.0)
-        yield (chw, mask, np.int64(idx), vs, has_v)
-        st.make_move_iccs(mv)
+            else:
+                has_v = True
+                if stm_cls == STM_OUTCOME_WIN:
+                    vs = np.float32(1.0)
+                elif stm_cls == STM_OUTCOME_LOSS:
+                    vs = np.float32(-1.0)
+                else:
+                    vs = np.float32(0.0)
+            yield (chw, mask, np.int64(idx), vs, has_v)
+            st.make_move_iccs(mv)
+    finally:
+        if doc is not None:
+            doc.clear()
 
 
 def infinite_shuffled_joint_samples(
