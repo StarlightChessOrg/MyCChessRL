@@ -559,6 +559,9 @@ struct PositionStruct {
     UndoMovePiece(mvsList[nMoveNum].wmv, mvsList[nMoveNum].ucpcCaptured);
   }
   void NullMove(void) {                       // ��һ���ղ�
+    if (nMoveNum >= MAX_MOVES) {
+      return;
+    }
     DWORD dwKey;
     dwKey = zobr.dwKey;
     ChangeSide();
@@ -635,6 +638,9 @@ void PositionStruct::UndoMovePiece(int mv, int pcCaptured) {
 
 // ��һ����
 BOOL PositionStruct::MakeMove(int mv) {
+  if (nMoveNum >= MAX_MOVES) {
+    return FALSE;
+  }
   int pcCaptured;
   DWORD dwKey;
 

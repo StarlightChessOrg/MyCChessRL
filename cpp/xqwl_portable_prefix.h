@@ -30,7 +30,8 @@ const int PIECE_CANNON = 5;
 const int PIECE_PAWN = 6;
 
 const int MAX_GEN_MOVES = 128;
-const int MAX_MOVES = 256;
+// 历史着法栈；原 256 不足以覆盖长棋谱（IMSA 等），越界写 mvsList 会触发 stack smashing / 堆损坏
+const int MAX_MOVES = 1024;
 const int LIMIT_DEPTH = 64;
 const int MATE_VALUE = 10000;
 const int BAN_VALUE = MATE_VALUE - 100;

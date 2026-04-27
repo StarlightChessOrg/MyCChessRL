@@ -174,7 +174,8 @@ def iter_joint_sl_samples_from_cbf(
                 else:
                     vs = np.float32(0.0)
             yield (chw, mask, np.int64(idx), vs, has_v)
-            st.make_move_iccs(mv)
+            if not st.make_move_iccs(mv):
+                return
     finally:
         if doc is not None:
             doc.clear()
