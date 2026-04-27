@@ -87,7 +87,7 @@ class JointPolicyValueNet(nn.Module):
 class JointPolicyValueConvTrm(nn.Module):
     """卷积残差茎压稀疏根平面 → 空间 token → **浅而宽** TransformerEncoder → 策略/价值。
 
-    棋盘固定 ``10×9``，展平为 ``90`` 个 token；默认 ``d_model=384``、``2`` 层 encoder，利于短训内拟合价值。
+    棋盘固定 ``10×9``，展平为 ``90`` 个 token；默认 **茎 1×ResBlock（160 通道）+ 1 层 Transformer（``d_model=768``）**，全精度权重约 **30MB** 量级，浅而宽、利于短训。
     """
 
     _BOARD_TOKENS = 90  # 10 * 9
@@ -96,11 +96,11 @@ class JointPolicyValueConvTrm(nn.Module):
         self,
         in_channels: int | None = None,
         *,
-        stem_channels: int = 96,
-        stem_num_res: int = 2,
-        d_model: int = 384,
+        stem_channels: int = 160,
+        stem_num_res: int = 1,
+        d_model: int = 768,
         nhead: int = 8,
-        trm_layers: int = 2,
+        trm_layers: int = 1,
         dim_feedforward: int | None = None,
         dropout: float = 0.08,
         policy_max_legal: int | None = None,
@@ -280,18 +280,18 @@ def load_policy_value_for_play(
         arch = "conv_transformer"
 
     if arch == "conv_transformer":
-        dm = int(ckpt.get("trm_d_model", _infer_trm_d_model_from_state(sd) or ckpt.get("filters", 384)))
+        dm = int(ckpt.get("trm_d_model", _infer_trm_d_model_from_state(sd) or ckpt.get("filters", 768)))
         nl = int(ckpt.get("trm_layers", 0))
         if nl <= 0:
-            nl = count_transformer_encoder_layers_in_state(sd) or int(ckpt.get("num_res_layers", 2))
+            nl = count_transformer_encoder_layers_in_state(sd) or int(ckpt.get("num_res_layers", 1))
         nh = int(ckpt.get("trm_nhead", 8))
         if dm % nh != 0:
             nh = _default_nhead_for_d_model(dm)
         df = int(ckpt.get("dim_feedforward", _infer_dim_feedforward_from_state(sd, dm)))
-        sc = int(ckpt.get("stem_channels", _infer_stem_channels_from_state(sd) or 96))
+        sc = int(ckpt.get("stem_channels", _infer_stem_channels_from_state(sd) or 160))
         snr = int(ckpt.get("stem_num_res", 0))
         if snr <= 0:
-            snr = count_resnet_blocks_in_state(sd, prefix="stem_blocks.") or 2
+            snr = count_resnet_blocks_in_state(sd, prefix="stem_blocks.") or 1
         model: nn.Module = JointPolicyValueConvTrm(
             in_channels=in_ch,
             stem_channels=sc,

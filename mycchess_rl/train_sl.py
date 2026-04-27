@@ -270,12 +270,12 @@ def main() -> None:
         default="resnet",
         help="无 --checkpoint 时 bootstrap 的骨干；从已有 .pt 加载时以权重内 arch 为准",
     )
-    p.add_argument("--trm-d-model", type=int, default=384)
-    p.add_argument("--trm-layers", type=int, default=2)
+    p.add_argument("--trm-d-model", type=int, default=768, help="与默认茎宽组合 FP32≈30MB")
+    p.add_argument("--trm-layers", type=int, default=1)
     p.add_argument("--trm-nhead", type=int, default=8)
     p.add_argument("--trm-ff", type=int, default=0, help="0=4×d_model")
-    p.add_argument("--stem-channels", type=int, default=96)
-    p.add_argument("--stem-num-res", type=int, default=2)
+    p.add_argument("--stem-channels", type=int, default=160)
+    p.add_argument("--stem-num-res", type=int, default=1)
     args = p.parse_args()
 
     _setup_logging(args.log_file)

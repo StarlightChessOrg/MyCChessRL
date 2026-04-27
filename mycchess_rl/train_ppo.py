@@ -180,8 +180,13 @@ def main() -> None:
         default="resnet",
         help="无 checkpoint 时的随机初始化骨干：resnet 或 卷积茎+浅宽 Transformer（续训时以权重文件为准）",
     )
-    p.add_argument("--trm-d-model", type=int, default=384, help="仅 conv_transformer：token 宽度")
-    p.add_argument("--trm-layers", type=int, default=2, help="仅 conv_transformer：TransformerEncoder 层数")
+    p.add_argument(
+        "--trm-d-model",
+        type=int,
+        default=768,
+        help="仅 conv_transformer：token 宽度（默认与茎宽搭配，FP32 权重约 30MB）",
+    )
+    p.add_argument("--trm-layers", type=int, default=1, help="仅 conv_transformer：TransformerEncoder 层数")
     p.add_argument("--trm-nhead", type=int, default=8, help="仅 conv_transformer：注意力头数（须整除 d_model）")
     p.add_argument(
         "--trm-ff",
@@ -189,8 +194,13 @@ def main() -> None:
         default=0,
         help="仅 conv_transformer：FFN 隐维；0 表示 4×d_model",
     )
-    p.add_argument("--stem-channels", type=int, default=96, help="仅 conv_transformer：卷积茎通道")
-    p.add_argument("--stem-num-res", type=int, default=2, help="仅 conv_transformer：茎上 ResBlock 个数")
+    p.add_argument(
+        "--stem-channels",
+        type=int,
+        default=160,
+        help="仅 conv_transformer：卷积茎通道（与 --trm-d-model 默认组合约 30MB 参数量）",
+    )
+    p.add_argument("--stem-num-res", type=int, default=1, help="仅 conv_transformer：茎上 ResBlock 个数")
     args = p.parse_args()
 
     _setup_logging(args.log_file)
