@@ -1,12 +1,15 @@
 """icyElephant / MyElephant 风格：``xmltodict`` 读 ``.cbf``，主进程无限打乱 + ``xqwl_core`` 回放（与 ``train_policy_torch`` 数据流一致，无 DataLoader）。"""
 from __future__ import annotations
 
+import multiprocessing as mp
+import os
 import random
 from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
 import xmltodict
+from tqdm import tqdm
 
 from mycchess_rl.chess.rationale import (
     POLICY_MAX_LEGAL_MOVES,
@@ -278,6 +281,63 @@ def count_joint_sl_samples_in_paths(
 ) -> int:
     """逐文件计数总和（顺序无关）。"""
     return int(sum(count_joint_sl_samples_in_file(p, policy_max_legal=policy_max_legal) for p in paths))
+
+
+def _count_sl_pool_initializer() -> None:
+    """子进程内压 OMP，避免多进程 × 多线程把 CPU 打满。"""
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+
+def _count_sl_samples_task(payload: tuple[str, int]) -> int:
+    """``ProcessPoolExecutor`` 顶层任务（须可 pickle）；``payload`` = ``(path, policy_max_legal)``。"""
+    path, policy_max_legal = payload
+    return int(count_joint_sl_samples_in_file(path, policy_max_legal=int(policy_max_legal)))
+
+
+def count_joint_sl_samples_paths_parallel(
+    paths: list[str],
+    *,
+    policy_max_legal: int = POLICY_MAX_LEGAL_MOVES,
+    max_workers: int,
+    tqdm_desc: str,
+) -> int:
+    """
+    多进程并行逐文件计数（**spawn**，避免主进程已加载 CUDA 时 fork 不安全）。
+    ``max_workers<=1`` 时退化为单进程 + 按文件 ``tqdm``。
+    """
+    if not paths:
+        return 0
+    w = int(max_workers)
+    if w <= 1:
+        n = 0
+        for p in tqdm(paths, desc=tqdm_desc, unit="file", leave=True, mininterval=0.2):
+            n += count_joint_sl_samples_in_file(p, policy_max_legal=policy_max_legal)
+        return int(n)
+
+    from concurrent.futures import ProcessPoolExecutor
+
+    w = max(1, min(w, len(paths)))
+    tasks = [(str(p), int(policy_max_legal)) for p in paths]
+    chunksize = max(1, len(tasks) // (w * 16))
+    ctx = mp.get_context("spawn")
+    total = 0
+    with ProcessPoolExecutor(
+        max_workers=w,
+        mp_context=ctx,
+        initializer=_count_sl_pool_initializer,
+    ) as ex:
+        for c in tqdm(
+            ex.map(_count_sl_samples_task, tasks, chunksize=chunksize),
+            total=len(paths),
+            desc=tqdm_desc,
+            unit="file",
+            leave=True,
+            mininterval=0.2,
+        ):
+            total += int(c)
+    return int(total)
 
 
 def iter_collated_batches_from_finite_samples(

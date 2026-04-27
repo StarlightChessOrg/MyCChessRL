@@ -35,7 +35,7 @@ except Exception:
 
 from mycchess_rl.model import JointPolicyValueNet, load_policy_value_for_play, torch_load_checkpoint
 from mycchess_rl.sl_data import (
-    count_joint_sl_samples_in_file,
+    count_joint_sl_samples_paths_parallel,
     discover_cbf_files,
     iter_collated_batches_from_finite_samples,
     iter_epoch_joint_samples_shuffled,
@@ -148,8 +148,9 @@ def _resolve_sample_counts(
     policy_max_legal: int,
     *,
     force_recount: bool,
-) -> tuple[int, int]:
-    """返回 (n_train_samples, n_val_samples)；可用 ``save_dir/sl_sample_counts.json`` 缓存避免重复全量扫描。"""
+    count_workers: int,
+) -> tuple[int, int, bool]:
+    """返回 ``(n_train_samples, n_val_samples, from_cache)``。"""
     cache_path = save_dir / _SL_COUNT_CACHE
     t_fp = _paths_fingerprint(train_files)
     v_fp = _paths_fingerprint(val_files)
@@ -161,27 +162,21 @@ def _resolve_sample_counts(
                 and raw.get("val_fingerprint") == v_fp
                 and int(raw.get("policy_max_legal", -1)) == int(policy_max_legal)
             ):
-                return int(raw["train_samples"]), int(raw["val_samples"])
+                return int(raw["train_samples"]), int(raw["val_samples"]), True
         except (OSError, TypeError, ValueError, KeyError):
             pass
-    n_train = 0
-    for p in tqdm(
+    n_train = count_joint_sl_samples_paths_parallel(
         train_files,
-        desc="[计数·非训练] train 棋谱文件",
-        unit="file",
-        leave=True,
-        mininterval=0.2,
-    ):
-        n_train += count_joint_sl_samples_in_file(p, policy_max_legal=policy_max_legal)
-    n_val = 0
-    for p in tqdm(
+        policy_max_legal=policy_max_legal,
+        max_workers=count_workers,
+        tqdm_desc="[计数·非训练] train 棋谱文件",
+    )
+    n_val = count_joint_sl_samples_paths_parallel(
         val_files,
-        desc="[计数·非训练] val 棋谱文件",
-        unit="file",
-        leave=True,
-        mininterval=0.2,
-    ):
-        n_val += count_joint_sl_samples_in_file(p, policy_max_legal=policy_max_legal)
+        policy_max_legal=policy_max_legal,
+        max_workers=count_workers,
+        tqdm_desc="[计数·非训练] val 棋谱文件",
+    )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(
         json.dumps(
@@ -197,7 +192,7 @@ def _resolve_sample_counts(
         ),
         encoding="utf-8",
     )
-    return n_train, n_val
+    return n_train, n_val, False
 
 
 def main() -> None:
@@ -223,6 +218,12 @@ def main() -> None:
         "--recount-samples",
         action="store_true",
         help="忽略 save-dir 下样本数缓存，强制重新统计 train/val 条数",
+    )
+    p.add_argument(
+        "--count-workers",
+        type=int,
+        default=0,
+        help="统计样本条数时的进程数；0 表示自动 min(16, CPU)。1 表示单进程。使用 spawn 子进程，与主进程已加载 CUDA 兼容。",
     )
     p.add_argument(
         "--log-every",
@@ -281,7 +282,8 @@ def main() -> None:
 
     _LOG.info(
         "监督学习（YOLO 式 epoch）：每轮 train 全量 → val 全量 → 更优则 best.pt，且每轮 last.pt；"
-        "batch_size=%d；样本条数缓存在 %s（--recount-samples 强制重算）。",
+        "batch_size=%d；样本条数缓存在 %s（--recount-samples 强制重算）；"
+        "首次统计可用多进程（--count-workers，默认自动）。",
         int(args.batch_size),
         _SL_COUNT_CACHE,
     )
@@ -335,13 +337,21 @@ def main() -> None:
         g["lr"] = float(args.lr)
     pm = model.policy_max_legal
     bs = int(args.batch_size)
-    n_train_samples, n_val_samples = _resolve_sample_counts(
+    cw = int(args.count_workers)
+    if cw <= 0:
+        cw = max(1, min(16, (os.cpu_count() or 4)))
+    n_train_samples, n_val_samples, counts_cached = _resolve_sample_counts(
         save_dir,
         train_files,
         val_files,
         pm,
         force_recount=bool(args.recount_samples),
+        count_workers=cw,
     )
+    if counts_cached:
+        _LOG.info("样本条数已从缓存读取（未启动多进程扫描）")
+    else:
+        _LOG.info("样本条数统计完成（多进程 spawn，count_workers=%d）", cw)
     if n_train_samples <= 0:
         raise RuntimeError("train 集样本数为 0：请检查 .cbf 与标准开局 FEN")
     n_train_batches = (n_train_samples + bs - 1) // bs
