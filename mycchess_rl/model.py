@@ -92,7 +92,7 @@ class JointPolicyValueConvTrm(nn.Module):
     """共享卷积茎 → **双主干**：宽 ``ResBlock×1`` 出策略；宽 **单层 Transformer** 出价值。
 
     茎与原先一致（窄通道 + ``stem_num_res`` 个 ResBlock）；策略与价值从茎特征分流，互不共享 trunk 表示。
-    默认宽度（策略/价值各 480）下 FP32 权重约 **29MB**。
+    价值 Transformer 默认 **``d_model=128``** 即可；容量主要给 **策略 Res 主干**（``policy_trunk_channels`` 默认较宽）。
     """
 
     _BOARD_TOKENS = 90  # 10 * 9
@@ -103,8 +103,8 @@ class JointPolicyValueConvTrm(nn.Module):
         *,
         stem_channels: int = 160,
         stem_num_res: int = 1,
-        policy_trunk_channels: int = 480,
-        d_model: int = 480,
+        policy_trunk_channels: int = 608,
+        d_model: int = 128,
         nhead: int = 8,
         trm_layers: int = 1,
         dim_feedforward: int | None = None,
@@ -356,12 +356,12 @@ def load_policy_value_for_play(
                 "与当前「共享茎 + 策略宽 ResBlock / 价值宽 Transformer」双主干不兼容，请用新结构重训。"
             )
         _ptc = ckpt.get("policy_trunk_channels")
-        ptc = int(_ptc) if _ptc is not None else int(_infer_policy_trunk_channels_from_state(sd) or 480)
+        ptc = int(_ptc) if _ptc is not None else int(_infer_policy_trunk_channels_from_state(sd) or 608)
         _dm = ckpt.get("trm_d_model")
         dm = (
             int(_dm)
             if _dm is not None
-            else int(_infer_value_d_model_from_state(sd) or ckpt.get("filters", 480))
+            else int(_infer_value_d_model_from_state(sd) or ckpt.get("filters", 128))
         )
         nl = int(ckpt.get("trm_layers", 0))
         if nl <= 0:

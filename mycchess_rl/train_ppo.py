@@ -184,14 +184,14 @@ def main() -> None:
     p.add_argument(
         "--policy-trunk-channels",
         type=int,
-        default=480,
-        help="仅 conv_transformer：策略主干 ResBlock 通道宽（默认与价值支路合计约 29MB FP32）",
+        default=608,
+        help="仅 conv_transformer：策略 ResBlock 宽（默认远大于价值支路）",
     )
     p.add_argument(
         "--trm-d-model",
         type=int,
-        default=480,
-        help="仅 conv_transformer：价值支路 Transformer 的 d_model（须整除 --trm-nhead）",
+        default=128,
+        help="仅 conv_transformer：价值 Transformer d_model（默认 128；须整除 --trm-nhead）",
     )
     p.add_argument("--trm-layers", type=int, default=1, help="仅 conv_transformer：TransformerEncoder 层数")
     p.add_argument("--trm-nhead", type=int, default=8, help="仅 conv_transformer：注意力头数（须整除 d_model）")

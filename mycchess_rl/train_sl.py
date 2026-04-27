@@ -273,10 +273,10 @@ def main() -> None:
     p.add_argument(
         "--policy-trunk-channels",
         type=int,
-        default=480,
-        help="conv_transformer：策略 ResBlock 宽（默认与 --trm-d-model 合计约 29MB FP32）",
+        default=608,
+        help="conv_transformer：策略 ResBlock 宽（默认远大于价值支路）",
     )
-    p.add_argument("--trm-d-model", type=int, default=480, help="conv_transformer：价值支路 d_model")
+    p.add_argument("--trm-d-model", type=int, default=128, help="conv_transformer：价值支路 d_model（默认 128）")
     p.add_argument("--trm-layers", type=int, default=1)
     p.add_argument("--trm-nhead", type=int, default=8)
     p.add_argument("--trm-ff", type=int, default=0, help="0=4×d_model")
