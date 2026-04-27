@@ -17,6 +17,7 @@ from mycchess_rl.model import (
     load_policy_value_for_play,
     policy_value_checkpoint_meta,
     torch_load_checkpoint,
+    trunk_policy_value_feats,
 )
 from mycchess_rl.policy_inference import (
     batched_encode_roots,
@@ -178,13 +179,19 @@ def main() -> None:
         type=str,
         choices=("resnet", "conv_transformer"),
         default="resnet",
-        help="无 checkpoint 时的随机初始化骨干：resnet 或 卷积茎+浅宽 Transformer（续训时以权重文件为准）",
+        help="无 checkpoint 时的随机初始化骨干：resnet 或 共享茎+策略Res/价值Trm（续训时以权重文件为准）",
+    )
+    p.add_argument(
+        "--policy-trunk-channels",
+        type=int,
+        default=480,
+        help="仅 conv_transformer：策略主干 ResBlock 通道宽（默认与价值支路合计约 29MB FP32）",
     )
     p.add_argument(
         "--trm-d-model",
         type=int,
-        default=768,
-        help="仅 conv_transformer：token 宽度（默认与茎宽搭配，FP32 权重约 30MB）",
+        default=480,
+        help="仅 conv_transformer：价值支路 Transformer 的 d_model（须整除 --trm-nhead）",
     )
     p.add_argument("--trm-layers", type=int, default=1, help="仅 conv_transformer：TransformerEncoder 层数")
     p.add_argument("--trm-nhead", type=int, default=8, help="仅 conv_transformer：注意力头数（须整除 d_model）")
@@ -198,7 +205,7 @@ def main() -> None:
         "--stem-channels",
         type=int,
         default=160,
-        help="仅 conv_transformer：卷积茎通道（与 --trm-d-model 默认组合约 30MB 参数量）",
+        help="仅 conv_transformer：卷积茎通道",
     )
     p.add_argument("--stem-num-res", type=int, default=1, help="仅 conv_transformer：茎上 ResBlock 个数")
     args = p.parse_args()
@@ -245,6 +252,7 @@ def main() -> None:
             model = JointPolicyValueConvTrm(
                 stem_channels=int(args.stem_channels),
                 stem_num_res=int(args.stem_num_res),
+                policy_trunk_channels=int(args.policy_trunk_channels),
                 d_model=int(args.trm_d_model),
                 nhead=int(args.trm_nhead),
                 trm_layers=int(args.trm_layers),
@@ -262,8 +270,8 @@ def main() -> None:
     arch_l = str(getattr(model, "arch", "resnet"))
     if arch_l == "conv_transformer":
         arch_desc = (
-            f"Conv+Trm in_ch={model.in_channels} d_model={getattr(model, 'd_model', '?')} "
-            f"trm_layers={getattr(model, 'trm_layers', '?')} stem_ch={getattr(model, 'stem_channels', '?')}"
+            f"Conv双主干 in_ch={model.in_channels} pol_ch={getattr(model, 'policy_trunk_channels', '?')} "
+            f"val_d={getattr(model, 'd_model', '?')} trm_L={getattr(model, 'trm_layers', '?')} stem={getattr(model, 'stem_channels', '?')}"
         )
     else:
         arch_desc = f"ResNet in_ch={model.in_channels} filters={model.filters} res={model.num_res_layers}"
@@ -506,21 +514,22 @@ def main() -> None:
             )
             with torch.no_grad():
                 model.eval()
-                feat_roll = model._trunk_flat(xb)
+                pol_roll, val_roll = trunk_policy_value_feats(model, xb)
                 _LOG.info(
                     "[ppo] update %d 计算 old_logp（整批 head，样本数=%d）...",
                     upd,
-                    feat_roll.shape[0],
+                    pol_roll.shape[0],
                 )
                 old_lp, legal_mask_b, action_idx_b = batched_joint_logprob_on_moves(
                     obs_list,
                     mv_list,
-                    feat_roll,
+                    pol_roll,
                     model,
                     device,
                     policy_temperature=1.0,
+                    value_feat=val_roll,
                 )
-                del feat_roll
+                del pol_roll, val_roll
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
             _LOG.info(

@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from mycchess_rl.chess.features import encode_model_planes
 from mycchess_rl.chess.rationale import STM_VALUE_TERMINAL_DRAW, STM_VALUE_TERMINAL_LOSS
-from mycchess_rl.model import PolicyValueBackbone, policy_temperature_scalar
+from mycchess_rl.model import PolicyValueBackbone, policy_temperature_scalar, trunk_policy_value_feats
 from mycchess_rl.xqwl_state import XqwlGameState
 
 
@@ -239,8 +239,8 @@ def batched_sample_moves_masked(
             encode_workers=encode_workers,
             encode_backend=encode_backend,
         )
-    feat_b = model._trunk_flat(xb)
-    logits_m, _ = model.forward_heads_from_feat(feat_b)
+    pol_b, val_b = trunk_policy_value_feats(model, xb)
+    logits_m, _ = model.forward_heads_from_feat(pol_b, value_feat=val_b)
     scaled = logits_m / T
 
     mask = torch.zeros(B, M, dtype=torch.bool, device=device)
@@ -280,6 +280,7 @@ def batched_joint_logprob_on_moves(
     device: torch.device,
     *,
     policy_temperature: float = 1.0,
+    value_feat: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """返回 ``(log_p, legal_mask, action_idx)``，与 PPO 损失输入一致。"""
     T = policy_temperature_scalar(policy_temperature)
@@ -293,7 +294,11 @@ def batched_joint_logprob_on_moves(
     mask, action_idx = joint_legal_mask_and_action_index(
         obs_list, mv_list, device, model.policy_max_legal
     )
-    logits_m, _ = model.forward_heads_from_feat(feat_b)
+    logits_m, _ = (
+        model.forward_heads_from_feat(feat_b, value_feat=value_feat)
+        if value_feat is not None
+        else model.forward_heads_from_feat(feat_b)
+    )
     scaled = logits_m / T
     scaled = scaled.masked_fill(~mask, -1e9)
     log_p = F.log_softmax(scaled, dim=1)
@@ -341,8 +346,8 @@ def batched_value_expectation(
                 encode_workers=encode_workers,
                 encode_backend=encode_backend,
             )
-        feat = model._trunk_flat(xb)
-        _, vals = model.forward_heads_from_feat(feat)
+        pol_b, val_b = trunk_policy_value_feats(model, xb)
+        _, vals = model.forward_heads_from_feat(pol_b, value_feat=val_b)
         for j, idx in enumerate(active):
             out[idx] = vals[j]
     return out

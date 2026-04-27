@@ -270,7 +270,13 @@ def main() -> None:
         default="resnet",
         help="无 --checkpoint 时 bootstrap 的骨干；从已有 .pt 加载时以权重内 arch 为准",
     )
-    p.add_argument("--trm-d-model", type=int, default=768, help="与默认茎宽组合 FP32≈30MB")
+    p.add_argument(
+        "--policy-trunk-channels",
+        type=int,
+        default=480,
+        help="conv_transformer：策略 ResBlock 宽（默认与 --trm-d-model 合计约 29MB FP32）",
+    )
+    p.add_argument("--trm-d-model", type=int, default=480, help="conv_transformer：价值支路 d_model")
     p.add_argument("--trm-layers", type=int, default=1)
     p.add_argument("--trm-nhead", type=int, default=8)
     p.add_argument("--trm-ff", type=int, default=0, help="0=4×d_model")
@@ -343,6 +349,7 @@ def main() -> None:
             model = JointPolicyValueConvTrm(
                 stem_channels=int(args.stem_channels),
                 stem_num_res=int(args.stem_num_res),
+                policy_trunk_channels=int(args.policy_trunk_channels),
                 d_model=int(args.trm_d_model),
                 nhead=int(args.trm_nhead),
                 trm_layers=int(args.trm_layers),
