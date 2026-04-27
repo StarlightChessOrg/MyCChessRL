@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mycchess-rl"
 version = "0.1.0"
-description = "中国象棋 RL：XQWL C++ 环境、两阶段策略网络、PPO、网页对弈"
+description = "中国象棋 RL：XQWL C++ 环境、联合策略网络、PPO、cbf 监督学习、网页对弈"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,6 +19,7 @@ dev = ["pytest>=7.0"]
 
 [project.scripts]
 mycchess-train-ppo = "mycchess_rl.train_ppo:main"
+mycchess-train-sl = "mycchess_rl.train_sl:main"
 mycchess-play-web = "mycchess_rl.play_web:main"
 
 [tool.setuptools.packages.find]

@@ -7,5 +7,8 @@ build/
 cpp/build/
 *.pyd
 *.so
-mycchess_ppo_last.pt
+runs/last.pt
+runs/best.pt
+runs/bootstrap.pt
+runs/weights/
 .pytest_cache/

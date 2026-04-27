@@ -40,6 +40,8 @@ cmake --build . --config Release
 | `mycchess_rl/policy_inference.py` | 贪心 / 批采样 / 价值 / PPO 用 `log π`（合法着法联合分布） |
 | `mycchess_rl/vec_env.py` | 并行环境步进 |
 | `mycchess_rl/train_ppo.py` | PPO 示意训练 |
+| `mycchess_rl/train_sl.py` | icyElephant 风格 XML ``.cbf`` 监督学习（联合策略头 + 价值 MSE） |
+| `mycchess_rl/sl_data.py` | 棋谱 IterableDataset / DataLoader |
 | `mycchess_rl/play_web.py` | Sanic 网页对弈 |
 
 ## 训练与对弈
@@ -49,13 +51,28 @@ python -m mycchess_rl.train_ppo
 python -m mycchess_rl.train_ppo --log-file runs/ppo.log --log-every 5
 python -m mycchess_rl.train_ppo --save-dir runs --save-every 100
 python -m mycchess_rl.train_ppo --resume --save-dir runs
-python -m mycchess_rl.train_ppo --resume --checkpoint runs/ppo_upd_000499.pt
+python -m mycchess_rl.train_ppo --resume --checkpoint runs/weights/upd_000499.pt
 mycchess-play-web --checkpoint path/to.pt --host 0.0.0.0 --port 8080
 ```
 
-训练脚本会按轮打印 **rollout / 优化耗时、样本数、GAE 统计、分项损失、熵、importance ratio、clip 比例、近似 KL、梯度范数、CUDA 显存** 等；`--log-every N` 为每 N 轮打一次，`--log-file` 同步写入文件。`--rollout-log-every`（默认 32）在单轮 rollout 内输出进度，避免首轮长时间无输出。
+**监督学习（cbf）**：与 [icyElephant](https://github.com/bupticybee/icyElephant) / MyElephant 相同 **XML ``ChineseChessRecord``** 棋谱；在 ``xqwl_core`` 上回放，对 **排序后的合法 ICCS 槽位** 做交叉熵，对 **行棋方终局**（``RecordResult`` 与 icy 一致：1 红胜 / 2 黑胜 / 3–4 和）做 **MSE 到 ``±value_scale`` / 0**。**当前引擎无 ``set_fen``**，仅加载 **与标准起始局面一致** 的 ``Head/FEN`` 的棋谱；中局起点或规则与 xqwl 不一致的着法会 **静默跳过** 该文件。
 
-**中途存盘**：默认 **`--save-dir runs`**，每 **`--save-every`** 轮（默认 **50**）写入 `runs/ppo_upd_000049.pt` 等（**全局** `upd` 编号，完成该轮后当 `(upd+1)` 整除 `save_every` 时保存）；训练结束再写 **`runs/mycchess_ppo_last.pt`**。`--save-every 0` 则仅写 `last`。训练用 checkpoint 另含 **`optimizer`**（Adam）与 **`update`**，供 **`--resume`** 续训：`--resume` 且未指定 `--checkpoint` 时默认读 `save-dir/mycchess_ppo_last.pt`；与 **`--checkpoint path`** 联用则从该文件恢复权重与优化器。仅推理/微调可不设 `--resume`，此时只读 `model` 等字段，从日志轮次 0 起算。
+**用法**：必须提供 **`--cbf-root`**（或 **`--cbf-manifest`**）。**`--checkpoint`** 可选：不写则脚本在 **`--save-dir`** 下 **自动生成** ``bootstrap.pt``（随机权重 + AdamW 初态，``epoch=-1``）并立刻开始训练；写了则加载该 ``.pt``。若文件是 **本脚本保存的 SL**（含整数 **`epoch`** 字段），会 **同时恢复优化器与 epoch/step**；若是 **PPO 等**（无 ``epoch``），则 **只加载权重**，优化器重新累积。
+
+```bash
+python -m mycchess_rl.train_sl --cbf-root /path/to/cbf --save-dir runs
+python -m mycchess_rl.train_sl --cbf-root /path/to/cbf --checkpoint runs/best.pt --save-dir runs
+python -m mycchess_rl.train_sl --cbf-root /path/to/cbf --checkpoint runs/last.pt --epochs 5 --save-dir runs
+python -m mycchess_rl.train_sl --cbf-manifest my_cbfs.txt --epochs 2 --n-batch-train 100
+```
+
+**`--epochs`**：本轮再跑多少个 epoch（续 SL 时在已完成的 epoch 之后追加）。
+
+默认 ``--num-workers 0``（避免部分环境下子进程与 ``xqwl_core`` 交互问题）；显存允许时可增大 ``--batch-size``。监督训练在 ``save-dir`` 下写 **`best.pt`** / **`last.pt`**（与 YOLO 命名一致；验证 loss 更优时更新 ``best.pt``），字段与 ``play_web`` / PPO 的 ``model`` 块兼容。
+
+``train_ppo`` 会按轮打印 **rollout / 优化耗时、样本数、GAE 统计、分项损失、熵、importance ratio、clip 比例、近似 KL、梯度范数、CUDA 显存** 等；`--log-every N` 为每 N 轮打一次，`--log-file` 同步写入文件。`--rollout-log-every`（默认 32）在单轮 rollout 内输出进度，避免首轮长时间无输出。
+
+**中途存盘（YOLO 风格）**：在 **`--save-dir`** 下每完成一轮 PPO 更新即覆盖 **`last.pt`**；当本轮 **`loss_total`** 低于历史最佳时额外写入 **`best.pt`**。可选 **`--save-every N`**（默认 50）：非 0 时另在 **`save-dir/weights/upd_000049.pt`** 按全局 ``upd`` 保留快照。训练用 checkpoint 含 **`optimizer`**（Adam）与 **`update`**，**`--resume`** 且未指定 **`--checkpoint`** 时默认读 **`save-dir/last.pt`**；也可 **`--checkpoint save-dir/best.pt`** 续训。仅推理可不设 ``--resume``，只读 ``model`` 等字段。
 
 **奖励塑形**：仅两项（**0=关闭该项**）。`--reward-shaping-king`：非终局鼓励落点靠近对方将/帅（接近度 ``prox∈[0,1]``）；若走后对方被应将，再叠加 ``(0.4+0.6·prox)`` 乘同一系数。`--reward-shaping-capture`：吃子时基量 × 子种相对权重（兵卒=1，象士、马、炮、车、将递增，见 ``vec_env`` 内 ``_CAPTURE_MULT``）。将死仍 **+1**；和棋等终局非将死为 **0**。两项全 **0** 时只有稀疏终局奖。
 

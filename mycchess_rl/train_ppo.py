@@ -81,7 +81,7 @@ def main() -> None:
     p.add_argument(
         "--resume",
         action="store_true",
-        help="续训：与 --checkpoint 指向训练存盘（含 optimizer 为佳），或省略 checkpoint 时用 --save-dir 下 mycchess_ppo_last.pt；"
+        help="续训：与 --checkpoint 指向训练存盘（含 optimizer 为佳），或省略 checkpoint 时用 --save-dir 下 last.pt；"
         "全局轮次从文件中 update+1 继续；本轮仍执行 --updates 次",
     )
     p.add_argument("--lr", type=float, default=3e-4)
@@ -147,7 +147,7 @@ def main() -> None:
         "--save-every",
         type=int,
         default=50,
-        help="每隔多少轮 update 保存一次 ``ppo_upd_*.pt``（0=仅训练结束时写 last）",
+        help="每隔多少轮额外写入 save-dir/weights/upd_*.pt（0=不保留按步快照；best.pt/last.pt 仍按 YOLO 习惯更新）",
     )
     p.add_argument(
         "--reward-shaping-king",
@@ -182,7 +182,7 @@ def main() -> None:
     if args.checkpoint is not None:
         ckpt_path_model = Path(args.checkpoint)
     elif args.resume:
-        ckpt_path_model = save_dir / "mycchess_ppo_last.pt"
+        ckpt_path_model = save_dir / "last.pt"
 
     if ckpt_path_model is not None:
         if not ckpt_path_model.is_file():
@@ -193,7 +193,7 @@ def main() -> None:
         _LOG.info("从 checkpoint 加载 model: %s", ckpt_path_model.resolve())
     else:
         if args.resume:
-            _LOG.error("--resume 需要 --checkpoint，或先有 %s", (save_dir / "mycchess_ppo_last.pt").resolve())
+            _LOG.error("--resume 需要 --checkpoint，或先有 %s", (save_dir / "last.pt").resolve())
             raise SystemExit(2)
         model = JointPolicyValueNet().to(device)
         from mycchess_rl.chess import FEATURE_LIST
@@ -226,7 +226,7 @@ def main() -> None:
         int(args.ppo_mini_batch),
     )
     _LOG.info(
-        "checkpoint 目录=%s | save_every=%d（0=仅结束时保存 last）",
+        "checkpoint 目录=%s | save_every=%d（0=不写 weights/upd_*.pt；仍每轮更新 last.pt，更优时写 best.pt）",
         save_dir.resolve(),
         save_every,
     )
@@ -237,6 +237,7 @@ def main() -> None:
     cfg = PPOConfig(lr=args.lr)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
 
+    best_loss_total = float("inf")
     start_global = 0
     if args.resume:
         assert ckpt_path_model is not None
@@ -254,6 +255,10 @@ def main() -> None:
         if start_global < 0:
             start_global = 0
         _LOG.info("续训：下一档全局 update=%d（文件中最后一档已完成=%d）", start_global, last_u)
+        rb = raw.get("best_loss_total")
+        if type(rb) in (int, float):
+            best_loss_total = float(rb)
+            _LOG.info("已恢复 best_loss_total=%.5f（用于与 best.pt 比较）", best_loss_total)
 
     for g in opt.param_groups:
         g["lr"] = float(args.lr)
@@ -280,12 +285,13 @@ def main() -> None:
             "value_scale": model.value_scale,
             "update": int(finished_upd),
             "optimizer": opt.state_dict(),
+            "kind": "ppo",
+            "best_loss_total": float(best_loss_total),
         }
 
-    def _save_last_checkpoint(finished_upd: int) -> Path:
-        out_p = save_dir / "mycchess_ppo_last.pt"
-        torch.save(_training_checkpoint_dict(finished_upd), out_p)
-        return out_p
+    def _save_checkpoint_file(path: Path, finished_upd: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(_training_checkpoint_dict(finished_upd), path)
 
     try:
         for k in range(args.updates):
@@ -537,10 +543,21 @@ def main() -> None:
 
             last_finished_update = upd
 
+            last_p = save_dir / "last.pt"
+            _save_checkpoint_file(last_p, upd)
+            lt = float(m["loss_total"])
+            if lt < best_loss_total:
+                best_loss_total = lt
+                best_p = save_dir / "best.pt"
+                _save_checkpoint_file(best_p, upd)
+                _LOG.info("新最佳 loss_total=%.5f -> %s", lt, best_p.resolve())
+
             if save_every > 0 and (upd + 1) % save_every == 0:
-                ckpt = save_dir / f"ppo_upd_{upd:06d}.pt"
-                torch.save(_training_checkpoint_dict(upd), ckpt)
-                _LOG.info("已保存中途 checkpoint update=%d -> %s", upd, ckpt)
+                wdir = save_dir / "weights"
+                wdir.mkdir(parents=True, exist_ok=True)
+                ckpt = wdir / f"upd_{upd:06d}.pt"
+                _save_checkpoint_file(ckpt, upd)
+                _LOG.info("已保存权重快照 update=%d -> %s", upd, ckpt)
 
     except KeyboardInterrupt:
         interrupted = True
@@ -548,18 +565,19 @@ def main() -> None:
     finally:
         total_s = time.perf_counter() - t_train0
         if last_finished_update is not None:
-            out = _save_last_checkpoint(last_finished_update)
+            out = save_dir / "last.pt"
+            _save_checkpoint_file(out, last_finished_update)
             if interrupted:
                 _LOG.info(
-                    "已保存中断点权重 wall_total=%.1fs | %s (update=%d)",
+                    "已保存 last.pt wall_total=%.1fs | %s (update=%d)",
                     total_s,
-                    out,
+                    out.resolve(),
                     last_finished_update,
                 )
             else:
-                _LOG.info("训练结束 wall_total=%.1fs | 已保存 %s", total_s, out)
+                _LOG.info("训练结束 wall_total=%.1fs | 已保存 %s", total_s, out.resolve())
         else:
-            _LOG.warning("尚未完成任一整轮 PPO 更新，未写入 mycchess_ppo_last.pt | wall_total=%.1fs", total_s)
+            _LOG.warning("尚未完成任一整轮 PPO 更新，未写入 last.pt | wall_total=%.1fs", total_s)
 
 
 if __name__ == "__main__":
