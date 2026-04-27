@@ -225,12 +225,6 @@ def main() -> None:
         default=0,
         help="统计样本条数时的进程数；0 表示自动 min(16, CPU)。1 表示单进程。使用 spawn 子进程，与主进程已加载 CUDA 兼容。",
     )
-    p.add_argument(
-        "--log-every",
-        type=int,
-        default=50,
-        help="训练时每隔多少个 batch 打一行 INFO（EMA loss/acc + 当前 batch）；0 表示不打。每个 batch 的 EMA 仍由 tqdm  postfix 刷新。",
-    )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--value-loss-weight", type=float, default=0.25, help="价值 MSE 相对策略 CE 权重")
@@ -340,198 +334,195 @@ def main() -> None:
     cw = int(args.count_workers)
     if cw <= 0:
         cw = max(1, min(16, (os.cpu_count() or 4)))
-    n_train_samples, n_val_samples, counts_cached = _resolve_sample_counts(
-        save_dir,
-        train_files,
-        val_files,
-        pm,
-        force_recount=bool(args.recount_samples),
-        count_workers=cw,
-    )
-    if counts_cached:
-        _LOG.info("样本条数已从缓存读取（未启动多进程扫描）")
-    else:
-        _LOG.info("样本条数统计完成（多进程 spawn，count_workers=%d）", cw)
-    if n_train_samples <= 0:
-        raise RuntimeError("train 集样本数为 0：请检查 .cbf 与标准开局 FEN")
-    n_train_batches = (n_train_samples + bs - 1) // bs
-    n_val_batches = (n_val_samples + bs - 1) // bs if n_val_samples > 0 else 0
-    _LOG.info(
-        "样本计数: train=%d 条 → %d 批 | val=%d 条 → %d 批",
-        n_train_samples,
-        n_train_batches,
-        n_val_samples,
-        n_val_batches,
-    )
 
+    epoch = -1
+    training_started = False
     t0 = time.perf_counter()
-
-    for k in range(int(args.epochs)):
-        epoch = epoch_begin + k
-        exp_loss = _ExpVal()
-        exp_acc = _ExpVal()
-        model.train()
-
-        ep_tr_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 7)
-        train_iter = iter_collated_batches_from_finite_samples(
-            iter_epoch_joint_samples_shuffled(train_files, policy_max_legal=pm, rng=ep_tr_rng),
-            bs,
-            drop_last=False,
+    try:
+        n_train_samples, n_val_samples, counts_cached = _resolve_sample_counts(
+            save_dir,
+            train_files,
+            val_files,
+            pm,
+            force_recount=bool(args.recount_samples),
+            count_workers=cw,
         )
-        pbar_tr = tqdm(
-            train_iter,
-            total=n_train_batches,
-            desc=f"epoch {epoch} train",
-            unit="batch",
-            leave=True,
-            mininterval=0.0,
-            miniters=1,
-            dynamic_ncols=True,
+        if counts_cached:
+            _LOG.info("样本条数已从缓存读取（未启动多进程扫描）")
+        else:
+            _LOG.info("样本条数统计完成（多进程 spawn，count_workers=%d）", cw)
+        if n_train_samples <= 0:
+            raise RuntimeError("train 集样本数为 0：请检查 .cbf 与标准开局 FEN")
+        n_train_batches = (n_train_samples + bs - 1) // bs
+        n_val_batches = (n_val_samples + bs - 1) // bs if n_val_samples > 0 else 0
+        _LOG.info(
+            "样本计数: train=%d 条 → %d 批 | val=%d 条 → %d 批",
+            n_train_samples,
+            n_train_batches,
+            n_val_samples,
+            n_val_batches,
         )
-        train_bi = 0
-        for x_np, m_np, yi_np, vs_np, hv_np in pbar_tr:
-            train_bi += 1
-            x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(x_np, m_np, yi_np, vs_np, hv_np, device)
-            opt.zero_grad(set_to_none=True)
-            logits_m, v_pred = model(x)
-            logits_masked = logits_m.masked_fill(~mask, -1e9)
-            loss_p = F.cross_entropy(logits_masked, tgt)
-            target_v = v_sign * float(model.value_scale)
-            if has_v.any():
-                loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
-            else:
-                loss_v = torch.zeros((), device=device)
-            loss = loss_p + float(args.value_loss_weight) * loss_v
-            loss.backward()
-            opt.step()
-            global_step += 1
-            with torch.no_grad():
-                pred = logits_masked.argmax(dim=-1)
-                acc = float((pred == tgt).float().mean().item())
-            exp_loss.update(float(loss.item()))
-            exp_acc.update(acc * 100.0)
-            el_b = exp_loss.get()
-            ea_b = exp_acc.get()
-            ema_l = float(el_b) if el_b is not None else float(loss.item())
-            ema_a = float(ea_b) if ea_b is not None else float(acc * 100.0)
-            raw_l = float(loss.item())
-            raw_a = float(acc * 100.0)
-            pbar_tr.set_postfix_str(
-                f"EMA_loss={ema_l:.4f} EMA_acc={ema_a:.2f}% | "
-                f"batch_loss={raw_l:.4f} batch_acc={raw_a:.2f}% | step={global_step}",
-                refresh=True,
+
+        for k in range(int(args.epochs)):
+            epoch = epoch_begin + k
+            exp_loss = _ExpVal()
+            exp_acc = _ExpVal()
+            model.train()
+
+            ep_tr_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 7)
+            train_iter = iter_collated_batches_from_finite_samples(
+                iter_epoch_joint_samples_shuffled(train_files, policy_max_legal=pm, rng=ep_tr_rng),
+                bs,
+                drop_last=False,
             )
-            le = int(args.log_every)
-            if le > 0 and (train_bi == 1 or train_bi % le == 0):
-                _LOG.info(
-                    "epoch %d train batch %d/%d | EMA loss=%.4f EMA acc=%.2f%% | "
-                    "batch loss=%.4f batch acc=%.2f%% | step=%d",
-                    epoch,
-                    train_bi,
-                    n_train_batches,
-                    ema_l,
-                    ema_a,
-                    raw_l,
-                    raw_a,
-                    global_step,
-                )
-
-        el = exp_loss.get()
-        ea = exp_acc.get()
-        if el is not None and ea is not None:
-            _LOG.info("epoch %d train 结束 | EMA loss=%s acc%%=%s | step=%d", epoch, el, ea, global_step)
-
-        model.eval()
-        v_losses: list[float] = []
-        v_accs: list[float] = []
-        val_ema_loss = _ExpVal()
-        val_ema_acc = _ExpVal()
-        with torch.no_grad():
-            if n_val_batches <= 0:
-                val_iter = iter(())
-                val_total = 0
-            else:
-                ep_va_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 900_017)
-                val_iter = iter_collated_batches_from_finite_samples(
-                    iter_epoch_joint_samples_shuffled(
-                        val_files, policy_max_legal=pm, rng=ep_va_rng
-                    ),
-                    bs,
-                    drop_last=False,
-                )
-                val_total = n_val_batches
-            pbar_va = tqdm(
-                val_iter,
-                total=val_total,
-                desc=f"epoch {epoch} val",
+            pbar_tr = tqdm(
+                train_iter,
+                total=n_train_batches,
+                desc=f"epoch {epoch} train",
                 unit="batch",
                 leave=True,
                 mininterval=0.0,
                 miniters=1,
                 dynamic_ncols=True,
             )
-            val_bi = 0
-            for x_np, m_np, yi_np, vs_np, hv_np in pbar_va:
-                val_bi += 1
-                x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(
-                    x_np, m_np, yi_np, vs_np, hv_np, device
-                )
+            train_bi = 0
+            training_started = True
+            for x_np, m_np, yi_np, vs_np, hv_np in pbar_tr:
+                train_bi += 1
+                x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(x_np, m_np, yi_np, vs_np, hv_np, device)
+                opt.zero_grad(set_to_none=True)
                 logits_m, v_pred = model(x)
                 logits_masked = logits_m.masked_fill(~mask, -1e9)
                 loss_p = F.cross_entropy(logits_masked, tgt)
+                target_v = v_sign * float(model.value_scale)
                 if has_v.any():
-                    target_v = v_sign * float(model.value_scale)
                     loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
                 else:
                     loss_v = torch.zeros((), device=device)
                 loss = loss_p + float(args.value_loss_weight) * loss_v
-                pred = logits_masked.argmax(dim=-1)
-                v_b = float(loss.item())
-                a_b = float((pred == tgt).float().mean().item() * 100.0)
-                v_losses.append(v_b)
-                v_accs.append(a_b)
-                val_ema_loss.update(v_b)
-                val_ema_acc.update(a_b)
-                vl_e = val_ema_loss.get()
-                va_e = val_ema_acc.get()
-                ema_vl = float(vl_e) if vl_e is not None else v_b
-                ema_va = float(va_e) if va_e is not None else a_b
-                pbar_va.set_postfix_str(
-                    f"EMA_loss={ema_vl:.4f} EMA_acc={ema_va:.2f}% | "
-                    f"batch_loss={v_b:.4f} batch_acc={a_b:.2f}%",
+                loss.backward()
+                opt.step()
+                global_step += 1
+                with torch.no_grad():
+                    pred = logits_masked.argmax(dim=-1)
+                    acc = float((pred == tgt).float().mean().item())
+                exp_loss.update(float(loss.item()))
+                exp_acc.update(acc * 100.0)
+                el_b = exp_loss.get()
+                ea_b = exp_acc.get()
+                ema_l = float(el_b) if el_b is not None else float(loss.item())
+                ema_a = float(ea_b) if ea_b is not None else float(acc * 100.0)
+                raw_l = float(loss.item())
+                raw_a = float(acc * 100.0)
+                pbar_tr.set_postfix_str(
+                    f"EMA_loss={ema_l:.4f} EMA_acc={ema_a:.2f}% | "
+                    f"batch_loss={raw_l:.4f} batch_acc={raw_a:.2f}% | step={global_step}",
                     refresh=True,
                 )
-                le = int(args.log_every)
-                if le > 0 and (val_bi == 1 or val_bi % le == 0):
-                    _LOG.info(
-                        "epoch %d val batch %d/%d | EMA loss=%.4f EMA acc=%.2f%% | "
-                        "batch loss=%.4f batch acc=%.2f%%",
-                        epoch,
-                        val_bi,
-                        val_total,
-                        ema_vl,
-                        ema_va,
-                        v_b,
-                        a_b,
+
+            el = exp_loss.get()
+            ea = exp_acc.get()
+            if el is not None and ea is not None:
+                _LOG.info("epoch %d train 结束 | EMA loss=%s acc%%=%s | step=%d", epoch, el, ea, global_step)
+
+            model.eval()
+            v_losses: list[float] = []
+            v_accs: list[float] = []
+            val_ema_loss = _ExpVal()
+            val_ema_acc = _ExpVal()
+            with torch.no_grad():
+                if n_val_batches <= 0:
+                    val_iter = iter(())
+                    val_total = 0
+                else:
+                    ep_va_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 900_017)
+                    val_iter = iter_collated_batches_from_finite_samples(
+                        iter_epoch_joint_samples_shuffled(
+                            val_files, policy_max_legal=pm, rng=ep_va_rng
+                        ),
+                        bs,
+                        drop_last=False,
+                    )
+                    val_total = n_val_batches
+                pbar_va = tqdm(
+                    val_iter,
+                    total=val_total,
+                    desc=f"epoch {epoch} val",
+                    unit="batch",
+                    leave=True,
+                    mininterval=0.0,
+                    miniters=1,
+                    dynamic_ncols=True,
+                )
+                val_bi = 0
+                for x_np, m_np, yi_np, vs_np, hv_np in pbar_va:
+                    val_bi += 1
+                    x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(
+                        x_np, m_np, yi_np, vs_np, hv_np, device
+                    )
+                    logits_m, v_pred = model(x)
+                    logits_masked = logits_m.masked_fill(~mask, -1e9)
+                    loss_p = F.cross_entropy(logits_masked, tgt)
+                    if has_v.any():
+                        target_v = v_sign * float(model.value_scale)
+                        loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
+                    else:
+                        loss_v = torch.zeros((), device=device)
+                    loss = loss_p + float(args.value_loss_weight) * loss_v
+                    pred = logits_masked.argmax(dim=-1)
+                    v_b = float(loss.item())
+                    a_b = float((pred == tgt).float().mean().item() * 100.0)
+                    v_losses.append(v_b)
+                    v_accs.append(a_b)
+                    val_ema_loss.update(v_b)
+                    val_ema_acc.update(a_b)
+                    vl_e = val_ema_loss.get()
+                    va_e = val_ema_acc.get()
+                    ema_vl = float(vl_e) if vl_e is not None else v_b
+                    ema_va = float(va_e) if va_e is not None else a_b
+                    pbar_va.set_postfix_str(
+                        f"EMA_loss={ema_vl:.4f} EMA_acc={ema_va:.2f}% | "
+                        f"batch_loss={v_b:.4f} batch_acc={a_b:.2f}%",
+                        refresh=True,
                     )
 
-        if v_losses:
-            val_m = float(np.mean(v_losses))
-            val_a = float(np.mean(v_accs))
-            _LOG.info("epoch %d val | loss_mean=%.4f acc_mean=%.2f%%", epoch, val_m, val_a)
-            if val_m < best_val:
-                best_val = val_m
-                out = save_dir / "best.pt"
-                _save_ckpt(out, model, opt, epoch=epoch, global_step=global_step, best_val=best_val)
-                _LOG.info("已写入 best -> %s", out.resolve())
-        else:
-            _LOG.info("epoch %d val | 无验证 batch，跳过 best.pt 更新", epoch)
+            if v_losses:
+                val_m = float(np.mean(v_losses))
+                val_a = float(np.mean(v_accs))
+                _LOG.info("epoch %d val | loss_mean=%.4f acc_mean=%.2f%%", epoch, val_m, val_a)
+                if val_m < best_val:
+                    best_val = val_m
+                    out = save_dir / "best.pt"
+                    _save_ckpt(out, model, opt, epoch=epoch, global_step=global_step, best_val=best_val)
+                    _LOG.info("已写入 best -> %s", out.resolve())
+            else:
+                _LOG.info("epoch %d val | 无验证 batch，跳过 best.pt 更新", epoch)
 
-        last = save_dir / "last.pt"
-        _save_ckpt(last, model, opt, epoch=epoch, global_step=global_step, best_val=best_val)
+            last = save_dir / "last.pt"
+            _save_ckpt(last, model, opt, epoch=epoch, global_step=global_step, best_val=best_val)
 
-    dt = time.perf_counter() - t0
-    _LOG.info("监督训练结束 wall=%.1fs | best_val_loss=%.4f | last=%s", dt, best_val, (save_dir / "last.pt").resolve())
+        dt = time.perf_counter() - t0
+        _LOG.info("监督训练结束 wall=%.1fs | best_val_loss=%.4f | last=%s", dt, best_val, (save_dir / "last.pt").resolve())
+
+    except KeyboardInterrupt:
+        _LOG.warning(
+            "收到 KeyboardInterrupt（Ctrl+C）。指标请看 tqdm；本轮可能未完成 train/val。"
+        )
+        if training_started and global_step > 0:
+            try:
+                last = save_dir / "last.pt"
+                _save_ckpt(
+                    last,
+                    model,
+                    opt,
+                    epoch=int(epoch),
+                    global_step=int(global_step),
+                    best_val=float(best_val),
+                )
+                _LOG.warning("已尽力写入 last.pt（epoch=%d step=%d），续训请自行确认是否重复本 epoch。", epoch, global_step)
+            except Exception as e:
+                _LOG.error("中断时保存 last.pt 失败: %s", e)
+        sys.exit(130)
 
 
 if __name__ == "__main__":
