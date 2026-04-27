@@ -216,7 +216,7 @@ def main() -> None:
     p.add_argument(
         "--epochs",
         type=int,
-        default=3,
+        default=10000,
         help="本轮要跑的 epoch 数（续训时在已完成的 epoch 之后再跑这么多个）",
     )
     p.add_argument(
