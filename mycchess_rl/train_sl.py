@@ -385,6 +385,14 @@ def main() -> None:
             encode_workers,
             prefetch_batches,
         )
+        vl_w = float(args.value_loss_weight)
+        _LOG.info(
+            "损失 total = pol_CE + (%.4g × val_MSE)；value_scale=%.4g。"
+            "训练初期价值头未拟合时 val 项常远大于 pol（tot 可到十几～二十以上），"
+            "随 val_MSE 下降后 total 会主要由 pol≈log(合法着法数) 主导（常见约 3～6）。",
+            vl_w,
+            float(model.value_scale),
+        )
 
         for k in range(int(args.epochs)):
             epoch = epoch_begin + k
@@ -428,24 +436,25 @@ def main() -> None:
                     loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
                 else:
                     loss_v = torch.zeros((), device=device)
-                loss = loss_p + float(args.value_loss_weight) * loss_v
+                loss = loss_p + vl_w * loss_v
+                loss_p_det = float(loss_p.detach().item())
+                loss_v_w_det = vl_w * float(loss_v.detach().item())
                 loss.backward()
                 opt.step()
                 global_step += 1
                 with torch.no_grad():
                     pred = logits_masked.argmax(dim=-1)
                     acc = float((pred == tgt).float().mean().item())
-                exp_loss.update(float(loss.item()))
+                raw_l = float(loss.item())
+                exp_loss.update(raw_l)
                 exp_acc.update(acc * 100.0)
                 el_b = exp_loss.get()
                 ea_b = exp_acc.get()
-                ema_l = float(el_b) if el_b is not None else float(loss.item())
+                ema_l = float(el_b) if el_b is not None else raw_l
                 ema_a = float(ea_b) if ea_b is not None else float(acc * 100.0)
-                raw_l = float(loss.item())
-                raw_a = float(acc * 100.0)
                 pbar_tr.set_postfix_str(
-                    f"EMA_loss={ema_l:.4f} EMA_acc={ema_a:.2f}% | "
-                    f"batch_loss={raw_l:.4f} batch_acc={raw_a:.2f}% | step={global_step}",
+                    f"tot={raw_l:.4f}(pol={loss_p_det:.4f}+vw={loss_v_w_det:.4f}) | "
+                    f"EMA={ema_l:.4f} acc={ema_a:.2f}% | step={global_step}",
                     refresh=True,
                 )
 
@@ -503,9 +512,11 @@ def main() -> None:
                         loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
                     else:
                         loss_v = torch.zeros((), device=device)
-                    loss = loss_p + float(args.value_loss_weight) * loss_v
+                    loss = loss_p + vl_w * loss_v
                     pred = logits_masked.argmax(dim=-1)
                     v_b = float(loss.item())
+                    pol_b = float(loss_p.detach().item())
+                    vw_b = vl_w * float(loss_v.detach().item())
                     a_b = float((pred == tgt).float().mean().item() * 100.0)
                     v_losses.append(v_b)
                     v_accs.append(a_b)
@@ -516,8 +527,8 @@ def main() -> None:
                     ema_vl = float(vl_e) if vl_e is not None else v_b
                     ema_va = float(va_e) if va_e is not None else a_b
                     pbar_va.set_postfix_str(
-                        f"EMA_loss={ema_vl:.4f} EMA_acc={ema_va:.2f}% | "
-                        f"batch_loss={v_b:.4f} batch_acc={a_b:.2f}%",
+                        f"tot={v_b:.4f}(pol={pol_b:.4f}+vw={vw_b:.4f}) | "
+                        f"EMA={ema_vl:.4f} acc={ema_va:.2f}%",
                         refresh=True,
                     )
 
