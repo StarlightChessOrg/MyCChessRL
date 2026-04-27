@@ -25,6 +25,7 @@ from mycchess_rl.chess.rationale import (
 )
 from mycchess_rl.encode_parallel import encode_packed_list_thread_pool, pack_planes_state
 from mycchess_rl.fen_parse import FULL_INIT_FEN, parse_fen_board
+from mycchess_rl.hierarchical_sl import build_hierarchical_sl_labels
 from mycchess_rl.xqwl_state import XqwlGameState
 
 T = TypeVar("T")
@@ -338,6 +339,11 @@ def _count_sl_samples_task(payload: tuple[str, int]) -> int:
     return int(count_joint_sl_samples_in_file(path, policy_max_legal=int(policy_max_legal)))
 
 
+def _count_hierarchical_sl_samples_task(path: str) -> int:
+    """并行计数用顶层函数（须可 pickle）。"""
+    return int(count_hierarchical_sl_samples_in_file(path))
+
+
 def count_joint_sl_samples_paths_parallel(
     paths: list[str],
     *,
@@ -400,3 +406,177 @@ def iter_collated_batches_from_finite_samples(
             buf = []
     if buf and not drop_last:
         yield collate_joint_sl_batch(buf, encode_workers=encode_workers)
+
+
+HierarchicalSlSample = tuple[Any, np.ndarray, np.int64, np.ndarray, np.int64, np.ndarray, np.int64, np.float32, bool]
+
+
+def iter_hierarchical_sl_samples_from_cbf(path: str | Path) -> Iterator[HierarchicalSlSample]:
+    """与 ``iter_joint_sl_samples_from_cbf`` 相同回放条件，标签为子种 / 源格 / 目标格 三步。"""
+    doc: dict[str, Any] | None = None
+    try:
+        try:
+            doc = _load_cbf_dict(path)
+        except Exception:
+            return
+        rec = doc.get("ChineseChessRecord")
+        if not isinstance(rec, dict):
+            return
+        head = rec.get("Head")
+        if not isinstance(head, dict):
+            return
+        fen = _xml_text(head.get("FEN"))
+        if not _fen_matches_standard_start(fen):
+            return
+        red_cls = red_outcome_class_from_head_dict(head)
+        ml = rec.get("MoveList") or {}
+        moves_raw = ml.get("Move")
+        moves = [
+            str(m["@value"])
+            for m in _normalize_move_entries(moves_raw)
+            if m.get("@value") not in (None, "00-00")
+        ]
+        st = XqwlGameState()
+        st.reset()
+        for mv in moves:
+            legs = sorted(st.legal_moves_iccs_str())
+            if not legs or mv not in legs:
+                return
+            dec = build_hierarchical_sl_labels(st, mv)
+            if dec is None:
+                return
+            mt, tt, mf, tf, m2, t2 = dec
+            packed = pack_planes_state(st)
+            stm_cls = int(stm_outcome_class_from_red_outcome(red_cls, bool(st.red_to_move)))
+            if stm_cls == VALUE_LABEL_IGNORE:
+                has_v = False
+                vs = np.float32(0.0)
+            else:
+                has_v = True
+                if stm_cls == STM_OUTCOME_WIN:
+                    vs = np.float32(1.0)
+                elif stm_cls == STM_OUTCOME_LOSS:
+                    vs = np.float32(-1.0)
+                else:
+                    vs = np.float32(0.0)
+            yield (packed, mt, tt, mf, tf, m2, t2, vs, has_v)
+            if not st.make_move_iccs(mv):
+                return
+    finally:
+        if doc is not None:
+            doc.clear()
+
+
+def collate_hierarchical_sl_batch(
+    batch: list[HierarchicalSlSample],
+    *,
+    encode_workers: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    first = batch[0][0]
+    if isinstance(first, np.ndarray) and first.ndim == 3:
+        x = np.stack([np.ascontiguousarray(np.array(b[0], dtype=np.float32, copy=True)) for b in batch], axis=0)
+    else:
+        packeds = [b[0] for b in batch]
+        x = np.ascontiguousarray(encode_packed_list_thread_pool(packeds, encode_workers), dtype=np.float32)
+    mt = np.stack([np.ascontiguousarray(np.array(b[1], dtype=np.bool_, copy=True)) for b in batch], axis=0)
+    tt = np.stack([np.int64(b[2]) for b in batch], axis=0)
+    mf = np.stack([np.ascontiguousarray(np.array(b[3], dtype=np.bool_, copy=True)) for b in batch], axis=0)
+    tf = np.stack([np.int64(b[4]) for b in batch], axis=0)
+    m2 = np.stack([np.ascontiguousarray(np.array(b[5], dtype=np.bool_, copy=True)) for b in batch], axis=0)
+    t2 = np.stack([np.int64(b[6]) for b in batch], axis=0)
+    vs = np.stack([np.float32(b[7]) for b in batch], axis=0)
+    hv = np.stack([np.bool_(b[8]) for b in batch], axis=0)
+    return x, mt, tt, mf, tf, m2, t2, vs, hv
+
+
+def iter_epoch_hierarchical_samples_shuffled(
+    filelist: list[str],
+    *,
+    rng: random.Random | None = None,
+) -> Iterator[HierarchicalSlSample]:
+    rnd = rng if rng is not None else random.Random()
+    fl = [str(x) for x in filelist]
+    if not fl:
+        raise ValueError("棋谱文件列表为空")
+    rnd.shuffle(fl)
+    yielded = False
+    for path in fl:
+        try:
+            for sample in iter_hierarchical_sl_samples_from_cbf(path):
+                yielded = True
+                yield sample
+        except Exception:
+            continue
+    if not yielded:
+        raise RuntimeError(
+            "本 epoch 未产生任何样本：请确认 .cbf 格式且 Head/FEN 与标准开局一致（当前 xqwl 无法 set_fen）"
+        )
+
+
+def iter_collated_hierarchical_batches_from_finite_samples(
+    sample_iter: Iterator[HierarchicalSlSample],
+    batch_size: int,
+    *,
+    drop_last: bool = False,
+    encode_workers: int = 1,
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size 须为正整数")
+    buf: list[HierarchicalSlSample] = []
+    for s in sample_iter:
+        buf.append(s)
+        if len(buf) >= batch_size:
+            yield collate_hierarchical_sl_batch(buf, encode_workers=encode_workers)
+            buf = []
+    if buf and not drop_last:
+        yield collate_hierarchical_sl_batch(buf, encode_workers=encode_workers)
+
+
+def count_hierarchical_sl_samples_in_file(path: str) -> int:
+    n = 0
+    try:
+        for _ in iter_hierarchical_sl_samples_from_cbf(path):
+            n += 1
+    except Exception:
+        return 0
+    return int(n)
+
+
+def count_hierarchical_sl_samples_paths_parallel(
+    paths: list[str],
+    *,
+    max_workers: int,
+    tqdm_desc: str,
+) -> int:
+    if not paths:
+        return 0
+    w = int(max_workers)
+    if w <= 1:
+        n = 0
+        for p in tqdm(paths, desc=tqdm_desc, unit="file", leave=True, mininterval=0.2):
+            n += count_hierarchical_sl_samples_in_file(p)
+        return int(n)
+
+    from concurrent.futures import ProcessPoolExecutor
+
+    w = max(1, min(w, len(paths)))
+    tasks = [str(p) for p in paths]
+    chunksize = max(1, len(tasks) // (w * 16))
+    ctx = mp.get_context("spawn")
+    total = 0
+
+    with ProcessPoolExecutor(
+        max_workers=w,
+        mp_context=ctx,
+        initializer=_count_sl_pool_initializer,
+    ) as ex:
+        for c in tqdm(
+            ex.map(_count_hierarchical_sl_samples_task, tasks, chunksize=chunksize),
+            total=len(paths),
+            desc=tqdm_desc,
+            unit="file",
+            leave=True,
+            mininterval=0.2,
+        ):
+            total += int(c)
+    return int(total)

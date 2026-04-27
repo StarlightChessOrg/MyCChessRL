@@ -1,4 +1,4 @@
-"""XML ``.cbf`` 监督学习：联合合法槽 softmax + 价值 MSE。
+"""XML ``.cbf`` 监督学习：联合合法槽 softmax + 价值 MSE，或 **层次化** 子种→源格→目标格 三 CE + 价值 MSE。
 
 每 epoch：**整轮训练集**（打乱棋谱文件顺序、每文件一轮）→ **整轮验证集** → 若验证 loss 更优则更新 ``best.pt``，并**总是**写入 ``last.pt``（对齐 YOLO 习惯）。进度条用 ``tqdm``。``--checkpoint`` 可选；SL 存盘可续优化器与 ``epoch``/``global_step``。
 """
@@ -36,16 +36,19 @@ except Exception:
 
 from mycchess_rl.encode_parallel import default_encode_workers
 from mycchess_rl.model import (
-    JointPolicyValueConvTrm,
-    JointPolicyValueNet,
+    InceptionHierarchicalPolicyValueNet,
+    InceptionJointPolicyValueNet,
     load_policy_value_for_play,
     policy_value_checkpoint_meta,
     torch_load_checkpoint,
 )
 from mycchess_rl.sl_data import (
+    count_hierarchical_sl_samples_paths_parallel,
     count_joint_sl_samples_paths_parallel,
     discover_cbf_files,
     iter_collated_batches_from_finite_samples,
+    iter_collated_hierarchical_batches_from_finite_samples,
+    iter_epoch_hierarchical_samples_shuffled,
     iter_epoch_joint_samples_shuffled,
     split_paths_train_test,
     thread_prefetch_iterator,
@@ -72,6 +75,40 @@ def _batch_tensors_to_device(
     v_sign = torch.tensor(np.ascontiguousarray(vs_np), dtype=torch.float32, device=device)
     has_v = torch.tensor(np.ascontiguousarray(hv_np), dtype=torch.bool, device=device)
     return x, mask, tgt, v_sign, has_v
+
+
+def _batch_hierarchical_to_device(
+    x_np: np.ndarray,
+    mt_np: np.ndarray,
+    tt_np: np.ndarray,
+    mf_np: np.ndarray,
+    tf_np: np.ndarray,
+    m2_np: np.ndarray,
+    t2_np: np.ndarray,
+    vs_np: np.ndarray,
+    hv_np: np.ndarray,
+    device: torch.device,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    x = torch.tensor(np.ascontiguousarray(x_np), dtype=torch.float32, device=device)
+    mt = torch.tensor(np.ascontiguousarray(mt_np), dtype=torch.bool, device=device)
+    tt = torch.tensor(np.ascontiguousarray(tt_np.astype(np.int64, copy=False)), dtype=torch.long, device=device)
+    mf = torch.tensor(np.ascontiguousarray(mf_np), dtype=torch.bool, device=device)
+    tf = torch.tensor(np.ascontiguousarray(tf_np.astype(np.int64, copy=False)), dtype=torch.long, device=device)
+    m2 = torch.tensor(np.ascontiguousarray(m2_np), dtype=torch.bool, device=device)
+    t2 = torch.tensor(np.ascontiguousarray(t2_np.astype(np.int64, copy=False)), dtype=torch.long, device=device)
+    v_sign = torch.tensor(np.ascontiguousarray(vs_np), dtype=torch.float32, device=device)
+    has_v = torch.tensor(np.ascontiguousarray(hv_np), dtype=torch.bool, device=device)
+    return x, mt, tt, mf, tf, m2, t2, v_sign, has_v
 
 
 def _setup_logging(log_file: Path | None) -> None:
@@ -117,7 +154,7 @@ def _save_ckpt(
         "model": model.state_dict(),
         "optimizer": opt.state_dict(),
         "in_channels": model.in_channels,
-        "policy_max_legal": model.policy_max_legal,
+        "policy_max_legal": int(getattr(model, "policy_max_legal", 0)),
         "value_scale": model.value_scale,
         "epoch": int(epoch),
         "global_step": int(global_step),
@@ -156,10 +193,12 @@ def _resolve_sample_counts(
     val_files: list[str],
     policy_max_legal: int,
     *,
+    hierarchical: bool,
     force_recount: bool,
     count_workers: int,
 ) -> tuple[int, int, bool]:
     """返回 ``(n_train_samples, n_val_samples, from_cache)``。"""
+    mode = "hierarchical" if hierarchical else "joint"
     cache_path = save_dir / _SL_COUNT_CACHE
     t_fp = _paths_fingerprint(train_files)
     v_fp = _paths_fingerprint(val_files)
@@ -169,30 +208,46 @@ def _resolve_sample_counts(
             if (
                 raw.get("train_fingerprint") == t_fp
                 and raw.get("val_fingerprint") == v_fp
-                and int(raw.get("policy_max_legal", -1)) == int(policy_max_legal)
+                and str(raw.get("policy_mode", "joint")) == mode
+                and (hierarchical or int(raw.get("policy_max_legal", -1)) == int(policy_max_legal))
             ):
                 return int(raw["train_samples"]), int(raw["val_samples"]), True
         except (OSError, TypeError, ValueError, KeyError):
             pass
-    n_train = count_joint_sl_samples_paths_parallel(
-        train_files,
-        policy_max_legal=policy_max_legal,
-        max_workers=count_workers,
-        tqdm_desc="[计数·非训练] train 棋谱文件",
-    )
-    n_val = count_joint_sl_samples_paths_parallel(
-        val_files,
-        policy_max_legal=policy_max_legal,
-        max_workers=count_workers,
-        tqdm_desc="[计数·非训练] val 棋谱文件",
-    )
+    if hierarchical:
+        n_train = count_hierarchical_sl_samples_paths_parallel(
+            train_files,
+            max_workers=count_workers,
+            tqdm_desc="[计数·非训练] train 棋谱文件（层次化）",
+        )
+        n_val = count_hierarchical_sl_samples_paths_parallel(
+            val_files,
+            max_workers=count_workers,
+            tqdm_desc="[计数·非训练] val 棋谱文件（层次化）",
+        )
+        pm_cache = 0
+    else:
+        n_train = count_joint_sl_samples_paths_parallel(
+            train_files,
+            policy_max_legal=policy_max_legal,
+            max_workers=count_workers,
+            tqdm_desc="[计数·非训练] train 棋谱文件",
+        )
+        n_val = count_joint_sl_samples_paths_parallel(
+            val_files,
+            policy_max_legal=policy_max_legal,
+            max_workers=count_workers,
+            tqdm_desc="[计数·非训练] val 棋谱文件",
+        )
+        pm_cache = int(policy_max_legal)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(
         json.dumps(
             {
                 "train_fingerprint": t_fp,
                 "val_fingerprint": v_fp,
-                "policy_max_legal": int(policy_max_legal),
+                "policy_mode": mode,
+                "policy_max_legal": pm_cache,
                 "train_samples": n_train,
                 "val_samples": n_val,
             },
@@ -205,7 +260,12 @@ def _resolve_sample_counts(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="MyCChessRL：cbf 监督学习（JointPolicyValueNet / Conv+Transformer）")
+    p = argparse.ArgumentParser(description="MyCChessRL：cbf 监督学习（Inception 共享主干：联合槽位 或 层次化 三头）")
+    p.add_argument(
+        "--hierarchical-policy",
+        action="store_true",
+        help="子种→源格→目标格 三 softmax（B 方案）；默认仍为有序合法着法联合槽位",
+    )
     p.add_argument("--cbf-root", type=Path, default=None, help="递归搜集该目录下 .cbf（与 --cbf-manifest 二选一）")
     p.add_argument(
         "--cbf-manifest",
@@ -264,35 +324,16 @@ def main() -> None:
     p.add_argument("--save-dir", type=Path, default=Path("runs"))
     p.add_argument("--log-file", type=Path, default=None)
     p.add_argument(
-        "--arch",
-        type=str,
-        choices=("resnet", "conv_transformer"),
-        default="resnet",
-        help="无 --checkpoint 时 bootstrap 的骨干；从已有 .pt 加载时以权重内 arch 为准",
-    )
-    p.add_argument(
-        "--policy-trunk-channels",
+        "--inc-stem",
         type=int,
-        default=608,
-        help="conv_transformer：策略 ResBlock 宽（默认远大于价值支路）",
+        default=128,
+        help="无 --checkpoint 时 Inception 茎通道（浅宽塔入口宽度）",
     )
-    p.add_argument("--trm-d-model", type=int, default=128, help="conv_transformer：价值支路 d_model（默认 128）")
-    p.add_argument("--trm-layers", type=int, default=1)
-    p.add_argument("--trm-nhead", type=int, default=8)
-    p.add_argument("--trm-ff", type=int, default=0, help="0=4×d_model")
-    p.add_argument("--stem-channels", type=int, default=160)
-    p.add_argument("--stem-num-res", type=int, default=1)
     args = p.parse_args()
 
     _setup_logging(args.log_file)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-
-    if str(args.arch).lower() == "conv_transformer":
-        dm, nh = int(args.trm_d_model), int(args.trm_nhead)
-        if dm % nh != 0:
-            _LOG.error("conv_transformer 要求 --trm-d-model（%d）能被 --trm-nhead（%d）整除", dm, nh)
-            raise SystemExit(2)
 
     if args.cbf_root is not None:
         all_cbf = discover_cbf_files(args.cbf_root, recursive=not args.cbf_shallow)
@@ -344,19 +385,12 @@ def main() -> None:
 
     ck = args.checkpoint
     if ck is None:
-        if str(args.arch).lower() == "conv_transformer":
-            trm_ff = int(args.trm_ff) if int(args.trm_ff) > 0 else None
-            model = JointPolicyValueConvTrm(
-                stem_channels=int(args.stem_channels),
-                stem_num_res=int(args.stem_num_res),
-                policy_trunk_channels=int(args.policy_trunk_channels),
-                d_model=int(args.trm_d_model),
-                nhead=int(args.trm_nhead),
-                trm_layers=int(args.trm_layers),
-                dim_feedforward=trm_ff,
-            ).to(device)
+        want_h = bool(args.hierarchical_policy)
+        stem = int(args.inc_stem)
+        if want_h:
+            model = InceptionHierarchicalPolicyValueNet(stem_channels=stem).to(device)
         else:
-            model = JointPolicyValueNet().to(device)
+            model = InceptionJointPolicyValueNet(stem_channels=stem).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
         boot = save_dir / "bootstrap.pt"
         _save_ckpt(boot, model, opt, epoch=-1, global_step=0, best_val=float("inf"))
@@ -391,9 +425,16 @@ def main() -> None:
         else:
             _LOG.info("从权重启动（新 AdamW，仅 model）: %s", cp.resolve())
 
+    hierarchical_train = str(getattr(model, "policy_kind", "joint")).lower() == "hierarchical"
+    if bool(args.hierarchical_policy) and not hierarchical_train and ck is not None:
+        _LOG.error("已指定 --hierarchical-policy，但 checkpoint 为联合槽位策略，二者不兼容。")
+        raise SystemExit(2)
+    if hierarchical_train and ck is not None and not bool(args.hierarchical_policy):
+        _LOG.info("checkpoint 为层次化策略（子种→源→目），已自动启用对应数据与三 ACC 记录。")
+
     for g in opt.param_groups:
         g["lr"] = float(args.lr)
-    pm = model.policy_max_legal
+    pm = int(getattr(model, "policy_max_legal", 0))
     bs = int(args.batch_size)
     cw = int(args.count_workers)
     if cw <= 0:
@@ -411,6 +452,7 @@ def main() -> None:
             train_files,
             val_files,
             pm,
+            hierarchical=hierarchical_train,
             force_recount=bool(args.recount_samples),
             count_workers=cw,
         )
@@ -436,26 +478,45 @@ def main() -> None:
         )
         vl_w = float(args.value_loss_weight)
         eff_vw = SL_VALUE_LOSS_GLOBAL_SCALE * vl_w
-        _LOG.info(
-            "损失 total = pol_CE + (eff×val_MSE)，eff=%.4g（=0.1×--value-loss-weight）；value_scale=%.4g。"
-            "价值项缩小后 tot 更接近 pol；若仍觉 val 过强可调小 --value-loss-weight。",
-            eff_vw,
-            float(model.value_scale),
-        )
+        if hierarchical_train:
+            _LOG.info(
+                "层次化策略：total = (CE子种+CE源+CE目)/3 + (eff×val_MSE)，eff=%.4g；value_scale=%.4g；"
+                "每步打印子种/源格/目标格 ACC（EMA）。",
+                eff_vw,
+                float(model.value_scale),
+            )
+        else:
+            _LOG.info(
+                "损失 total = pol_CE + (eff×val_MSE)，eff=%.4g（=0.1×--value-loss-weight）；value_scale=%.4g。"
+                "价值项缩小后 tot 更接近 pol；若仍觉 val 过强可调小 --value-loss-weight。",
+                eff_vw,
+                float(model.value_scale),
+            )
 
         for k in range(int(args.epochs)):
             epoch = epoch_begin + k
             exp_loss = _ExpVal()
             exp_acc = _ExpVal()
+            exp_acc_t = _ExpVal()
+            exp_acc_f = _ExpVal()
+            exp_acc_2 = _ExpVal()
             model.train()
 
             ep_tr_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 7)
-            train_base = iter_collated_batches_from_finite_samples(
-                iter_epoch_joint_samples_shuffled(train_files, policy_max_legal=pm, rng=ep_tr_rng),
-                bs,
-                drop_last=False,
-                encode_workers=encode_workers,
-            )
+            if hierarchical_train:
+                train_base = iter_collated_hierarchical_batches_from_finite_samples(
+                    iter_epoch_hierarchical_samples_shuffled(train_files, rng=ep_tr_rng),
+                    bs,
+                    drop_last=False,
+                    encode_workers=encode_workers,
+                )
+            else:
+                train_base = iter_collated_batches_from_finite_samples(
+                    iter_epoch_joint_samples_shuffled(train_files, policy_max_legal=pm, rng=ep_tr_rng),
+                    bs,
+                    drop_last=False,
+                    encode_workers=encode_workers,
+                )
             train_iter = (
                 thread_prefetch_iterator(train_base, prefetch_batches)
                 if prefetch_batches > 0
@@ -473,64 +534,142 @@ def main() -> None:
             )
             train_bi = 0
             training_started = True
-            for x_np, m_np, yi_np, vs_np, hv_np in pbar_tr:
-                train_bi += 1
-                x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(x_np, m_np, yi_np, vs_np, hv_np, device)
-                opt.zero_grad(set_to_none=True)
-                logits_m, v_pred = model(x)
-                logits_masked = logits_m.masked_fill(~mask, -1e9)
-                loss_p = F.cross_entropy(logits_masked, tgt)
-                target_v = v_sign * float(model.value_scale)
-                if has_v.any():
-                    loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
-                else:
-                    loss_v = torch.zeros((), device=device)
-                loss = loss_p + eff_vw * loss_v
-                loss_p_det = float(loss_p.detach().item())
-                loss_v_w_det = eff_vw * float(loss_v.detach().item())
-                loss.backward()
-                opt.step()
-                global_step += 1
-                with torch.no_grad():
-                    pred = logits_masked.argmax(dim=-1)
-                    acc = float((pred == tgt).float().mean().item())
-                raw_l = float(loss.item())
-                exp_loss.update(raw_l)
-                exp_acc.update(acc * 100.0)
-                el_b = exp_loss.get()
-                ea_b = exp_acc.get()
-                ema_l = float(el_b) if el_b is not None else raw_l
-                ema_a = float(ea_b) if ea_b is not None else float(acc * 100.0)
-                pbar_tr.set_postfix_str(
-                    f"tot={raw_l:.4f}(pol={loss_p_det:.4f}+vw={loss_v_w_det:.4f}) | "
-                    f"EMA={ema_l:.4f} acc={ema_a:.2f}% | step={global_step}",
-                    refresh=True,
-                )
+            if hierarchical_train:
+                for x_np, mt_np, tt_np, mf_np, tf_np, m2_np, t2_np, vs_np, hv_np in pbar_tr:
+                    train_bi += 1
+                    x, mt, tt, mf, tf, m2, t2, v_sign, has_v = _batch_hierarchical_to_device(
+                        x_np, mt_np, tt_np, mf_np, tf_np, m2_np, t2_np, vs_np, hv_np, device
+                    )
+                    opt.zero_grad(set_to_none=True)
+                    lt, lf, lto, v_pred = model(x)
+                    lt_m = lt.masked_fill(~mt, -1e9)
+                    lf_m = lf.masked_fill(~mf, -1e9)
+                    l2_m = lto.masked_fill(~m2, -1e9)
+                    ce_t = F.cross_entropy(lt_m, tt)
+                    ce_f = F.cross_entropy(lf_m, tf)
+                    ce_2 = F.cross_entropy(l2_m, t2)
+                    loss_p = (ce_t + ce_f + ce_2) / 3.0
+                    target_v = v_sign * float(model.value_scale)
+                    if has_v.any():
+                        loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
+                    else:
+                        loss_v = torch.zeros((), device=device)
+                    loss = loss_p + eff_vw * loss_v
+                    loss_p_det = float(loss_p.detach().item())
+                    loss_v_w_det = eff_vw * float(loss_v.detach().item())
+                    loss.backward()
+                    opt.step()
+                    global_step += 1
+                    with torch.no_grad():
+                        at = float((lt_m.argmax(dim=-1) == tt).float().mean().item())
+                        af = float((lf_m.argmax(dim=-1) == tf).float().mean().item())
+                        a2 = float((l2_m.argmax(dim=-1) == t2).float().mean().item())
+                    raw_l = float(loss.item())
+                    exp_loss.update(raw_l)
+                    exp_acc_t.update(at * 100.0)
+                    exp_acc_f.update(af * 100.0)
+                    exp_acc_2.update(a2 * 100.0)
+                    el_b = exp_loss.get()
+                    et_b = exp_acc_t.get()
+                    ef_b = exp_acc_f.get()
+                    e2_b = exp_acc_2.get()
+                    ema_l = float(el_b) if el_b is not None else raw_l
+                    ema_t = float(et_b) if et_b is not None else at * 100.0
+                    ema_f = float(ef_b) if ef_b is not None else af * 100.0
+                    ema_2 = float(e2_b) if e2_b is not None else a2 * 100.0
+                    pbar_tr.set_postfix_str(
+                        f"tot={raw_l:.4f}(pol3={loss_p_det:.4f}+vw={loss_v_w_det:.4f}) | "
+                        f"EMAloss={ema_l:.4f} acc种={ema_t:.1f}% acc源={ema_f:.1f}% acc目={ema_2:.1f}% | step={global_step}",
+                        refresh=True,
+                    )
+            else:
+                for x_np, m_np, yi_np, vs_np, hv_np in pbar_tr:
+                    train_bi += 1
+                    x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(x_np, m_np, yi_np, vs_np, hv_np, device)
+                    opt.zero_grad(set_to_none=True)
+                    logits_m, v_pred = model(x)
+                    logits_masked = logits_m.masked_fill(~mask, -1e9)
+                    loss_p = F.cross_entropy(logits_masked, tgt)
+                    target_v = v_sign * float(model.value_scale)
+                    if has_v.any():
+                        loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
+                    else:
+                        loss_v = torch.zeros((), device=device)
+                    loss = loss_p + eff_vw * loss_v
+                    loss_p_det = float(loss_p.detach().item())
+                    loss_v_w_det = eff_vw * float(loss_v.detach().item())
+                    loss.backward()
+                    opt.step()
+                    global_step += 1
+                    with torch.no_grad():
+                        pred = logits_masked.argmax(dim=-1)
+                        acc = float((pred == tgt).float().mean().item())
+                    raw_l = float(loss.item())
+                    exp_loss.update(raw_l)
+                    exp_acc.update(acc * 100.0)
+                    el_b = exp_loss.get()
+                    ea_b = exp_acc.get()
+                    ema_l = float(el_b) if el_b is not None else raw_l
+                    ema_a = float(ea_b) if ea_b is not None else float(acc * 100.0)
+                    pbar_tr.set_postfix_str(
+                        f"tot={raw_l:.4f}(pol={loss_p_det:.4f}+vw={loss_v_w_det:.4f}) | "
+                        f"EMA={ema_l:.4f} acc={ema_a:.2f}% | step={global_step}",
+                        refresh=True,
+                    )
 
             el = exp_loss.get()
-            ea = exp_acc.get()
-            if el is not None and ea is not None:
-                _LOG.info("epoch %d train 结束 | EMA loss=%s acc%%=%s | step=%d", epoch, el, ea, global_step)
+            if hierarchical_train:
+                eat = exp_acc_t.get()
+                eaf = exp_acc_f.get()
+                ea2 = exp_acc_2.get()
+                if el is not None and eat is not None and eaf is not None and ea2 is not None:
+                    _LOG.info(
+                        "epoch %d train 结束 | EMA loss=%s | acc子种%%=%s acc源%%=%s acc目%%=%s | step=%d",
+                        epoch,
+                        el,
+                        eat,
+                        eaf,
+                        ea2,
+                        global_step,
+                    )
+            else:
+                ea = exp_acc.get()
+                if el is not None and ea is not None:
+                    _LOG.info("epoch %d train 结束 | EMA loss=%s acc%%=%s | step=%d", epoch, el, ea, global_step)
 
             model.eval()
             v_losses: list[float] = []
             v_accs: list[float] = []
+            v_accs_t: list[float] = []
+            v_accs_f: list[float] = []
+            v_accs_2: list[float] = []
             val_ema_loss = _ExpVal()
             val_ema_acc = _ExpVal()
+            val_ema_t = _ExpVal()
+            val_ema_f = _ExpVal()
+            val_ema_2 = _ExpVal()
             with torch.no_grad():
                 if n_val_batches <= 0:
                     val_iter = iter(())
                     val_total = 0
                 else:
                     ep_va_rng = random.Random(int(args.data_seed) + epoch * 1_000_003 + 900_017)
-                    val_base = iter_collated_batches_from_finite_samples(
-                        iter_epoch_joint_samples_shuffled(
-                            val_files, policy_max_legal=pm, rng=ep_va_rng
-                        ),
-                        bs,
-                        drop_last=False,
-                        encode_workers=encode_workers,
-                    )
+                    if hierarchical_train:
+                        val_base = iter_collated_hierarchical_batches_from_finite_samples(
+                            iter_epoch_hierarchical_samples_shuffled(val_files, rng=ep_va_rng),
+                            bs,
+                            drop_last=False,
+                            encode_workers=encode_workers,
+                        )
+                    else:
+                        val_base = iter_collated_batches_from_finite_samples(
+                            iter_epoch_joint_samples_shuffled(
+                                val_files, policy_max_legal=pm, rng=ep_va_rng
+                            ),
+                            bs,
+                            drop_last=False,
+                            encode_workers=encode_workers,
+                        )
                     val_iter = (
                         thread_prefetch_iterator(val_base, prefetch_batches)
                         if prefetch_batches > 0
@@ -548,43 +687,104 @@ def main() -> None:
                     dynamic_ncols=True,
                 )
                 val_bi = 0
-                for x_np, m_np, yi_np, vs_np, hv_np in pbar_va:
-                    val_bi += 1
-                    x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(
-                        x_np, m_np, yi_np, vs_np, hv_np, device
-                    )
-                    logits_m, v_pred = model(x)
-                    logits_masked = logits_m.masked_fill(~mask, -1e9)
-                    loss_p = F.cross_entropy(logits_masked, tgt)
-                    if has_v.any():
-                        target_v = v_sign * float(model.value_scale)
-                        loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
-                    else:
-                        loss_v = torch.zeros((), device=device)
-                    loss = loss_p + eff_vw * loss_v
-                    pred = logits_masked.argmax(dim=-1)
-                    v_b = float(loss.item())
-                    pol_b = float(loss_p.detach().item())
-                    vw_b = eff_vw * float(loss_v.detach().item())
-                    a_b = float((pred == tgt).float().mean().item() * 100.0)
-                    v_losses.append(v_b)
-                    v_accs.append(a_b)
-                    val_ema_loss.update(v_b)
-                    val_ema_acc.update(a_b)
-                    vl_e = val_ema_loss.get()
-                    va_e = val_ema_acc.get()
-                    ema_vl = float(vl_e) if vl_e is not None else v_b
-                    ema_va = float(va_e) if va_e is not None else a_b
-                    pbar_va.set_postfix_str(
-                        f"tot={v_b:.4f}(pol={pol_b:.4f}+vw={vw_b:.4f}) | "
-                        f"EMA={ema_vl:.4f} acc={ema_va:.2f}%",
-                        refresh=True,
-                    )
+                if hierarchical_train:
+                    for x_np, mt_np, tt_np, mf_np, tf_np, m2_np, t2_np, vs_np, hv_np in pbar_va:
+                        val_bi += 1
+                        x, mt, tt, mf, tf, m2, t2, v_sign, has_v = _batch_hierarchical_to_device(
+                            x_np, mt_np, tt_np, mf_np, tf_np, m2_np, t2_np, vs_np, hv_np, device
+                        )
+                        lt, lf, lto, v_pred = model(x)
+                        lt_m = lt.masked_fill(~mt, -1e9)
+                        lf_m = lf.masked_fill(~mf, -1e9)
+                        l2_m = lto.masked_fill(~m2, -1e9)
+                        ce_t = F.cross_entropy(lt_m, tt)
+                        ce_f = F.cross_entropy(lf_m, tf)
+                        ce_2 = F.cross_entropy(l2_m, t2)
+                        loss_p = (ce_t + ce_f + ce_2) / 3.0
+                        if has_v.any():
+                            target_v = v_sign * float(model.value_scale)
+                            loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
+                        else:
+                            loss_v = torch.zeros((), device=device)
+                        loss = loss_p + eff_vw * loss_v
+                        at = float((lt_m.argmax(dim=-1) == tt).float().mean().item() * 100.0)
+                        af = float((lf_m.argmax(dim=-1) == tf).float().mean().item() * 100.0)
+                        a2 = float((l2_m.argmax(dim=-1) == t2).float().mean().item() * 100.0)
+                        v_b = float(loss.item())
+                        pol_b = float(loss_p.detach().item())
+                        vw_b = eff_vw * float(loss_v.detach().item())
+                        v_losses.append(v_b)
+                        v_accs_t.append(at)
+                        v_accs_f.append(af)
+                        v_accs_2.append(a2)
+                        val_ema_loss.update(v_b)
+                        val_ema_t.update(at)
+                        val_ema_f.update(af)
+                        val_ema_2.update(a2)
+                        vl_e = val_ema_loss.get()
+                        vt_e = val_ema_t.get()
+                        vf_e = val_ema_f.get()
+                        v2_e = val_ema_2.get()
+                        ema_vl = float(vl_e) if vl_e is not None else v_b
+                        ema_vt = float(vt_e) if vt_e is not None else at
+                        ema_vf = float(vf_e) if vf_e is not None else af
+                        ema_v2 = float(v2_e) if v2_e is not None else a2
+                        pbar_va.set_postfix_str(
+                            f"tot={v_b:.4f}(pol3={pol_b:.4f}+vw={vw_b:.4f}) | "
+                            f"EMA={ema_vl:.4f} acc种={ema_vt:.1f}% acc源={ema_vf:.1f}% acc目={ema_v2:.1f}%",
+                            refresh=True,
+                        )
+                else:
+                    for x_np, m_np, yi_np, vs_np, hv_np in pbar_va:
+                        val_bi += 1
+                        x, mask, tgt, v_sign, has_v = _batch_tensors_to_device(
+                            x_np, m_np, yi_np, vs_np, hv_np, device
+                        )
+                        logits_m, v_pred = model(x)
+                        logits_masked = logits_m.masked_fill(~mask, -1e9)
+                        loss_p = F.cross_entropy(logits_masked, tgt)
+                        if has_v.any():
+                            target_v = v_sign * float(model.value_scale)
+                            loss_v = F.mse_loss(v_pred[has_v], target_v[has_v])
+                        else:
+                            loss_v = torch.zeros((), device=device)
+                        loss = loss_p + eff_vw * loss_v
+                        pred = logits_masked.argmax(dim=-1)
+                        v_b = float(loss.item())
+                        pol_b = float(loss_p.detach().item())
+                        vw_b = eff_vw * float(loss_v.detach().item())
+                        a_b = float((pred == tgt).float().mean().item() * 100.0)
+                        v_losses.append(v_b)
+                        v_accs.append(a_b)
+                        val_ema_loss.update(v_b)
+                        val_ema_acc.update(a_b)
+                        vl_e = val_ema_loss.get()
+                        va_e = val_ema_acc.get()
+                        ema_vl = float(vl_e) if vl_e is not None else v_b
+                        ema_va = float(va_e) if va_e is not None else a_b
+                        pbar_va.set_postfix_str(
+                            f"tot={v_b:.4f}(pol={pol_b:.4f}+vw={vw_b:.4f}) | "
+                            f"EMA={ema_vl:.4f} acc={ema_va:.2f}%",
+                            refresh=True,
+                        )
 
             if v_losses:
                 val_m = float(np.mean(v_losses))
-                val_a = float(np.mean(v_accs))
-                _LOG.info("epoch %d val | loss_mean=%.4f acc_mean=%.2f%%", epoch, val_m, val_a)
+                if hierarchical_train:
+                    val_at = float(np.mean(v_accs_t))
+                    val_af = float(np.mean(v_accs_f))
+                    val_a2 = float(np.mean(v_accs_2))
+                    _LOG.info(
+                        "epoch %d val | loss_mean=%.4f | acc子种_mean=%.2f%% acc源_mean=%.2f%% acc目_mean=%.2f%%",
+                        epoch,
+                        val_m,
+                        val_at,
+                        val_af,
+                        val_a2,
+                    )
+                else:
+                    val_a = float(np.mean(v_accs))
+                    _LOG.info("epoch %d val | loss_mean=%.4f acc_mean=%.2f%%", epoch, val_m, val_a)
                 if val_m < best_val:
                     best_val = val_m
                     out = save_dir / "best.pt"

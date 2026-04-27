@@ -12,8 +12,7 @@ import torch
 
 from mycchess_rl.encode_parallel import default_encode_workers
 from mycchess_rl.model import (
-    JointPolicyValueConvTrm,
-    JointPolicyValueNet,
+    InceptionJointPolicyValueNet,
     load_policy_value_for_play,
     policy_value_checkpoint_meta,
     torch_load_checkpoint,
@@ -175,47 +174,14 @@ def main() -> None:
         help="吃子奖励基量（兵卒=1×），车马炮等按子种加权；0=关闭",
     )
     p.add_argument(
-        "--arch",
-        type=str,
-        choices=("resnet", "conv_transformer"),
-        default="resnet",
-        help="无 checkpoint 时的随机初始化骨干：resnet 或 共享茎+策略Res/价值Trm（续训时以权重文件为准）",
-    )
-    p.add_argument(
-        "--policy-trunk-channels",
-        type=int,
-        default=608,
-        help="仅 conv_transformer：策略 ResBlock 宽（默认远大于价值支路）",
-    )
-    p.add_argument(
-        "--trm-d-model",
+        "--inc-stem",
         type=int,
         default=128,
-        help="仅 conv_transformer：价值 Transformer d_model（默认 128；须整除 --trm-nhead）",
+        help="无 checkpoint 时 Inception 茎通道（与 train_sl --inc-stem 一致）",
     )
-    p.add_argument("--trm-layers", type=int, default=1, help="仅 conv_transformer：TransformerEncoder 层数")
-    p.add_argument("--trm-nhead", type=int, default=8, help="仅 conv_transformer：注意力头数（须整除 d_model）")
-    p.add_argument(
-        "--trm-ff",
-        type=int,
-        default=0,
-        help="仅 conv_transformer：FFN 隐维；0 表示 4×d_model",
-    )
-    p.add_argument(
-        "--stem-channels",
-        type=int,
-        default=160,
-        help="仅 conv_transformer：卷积茎通道",
-    )
-    p.add_argument("--stem-num-res", type=int, default=1, help="仅 conv_transformer：茎上 ResBlock 个数")
     args = p.parse_args()
 
     _setup_logging(args.log_file)
-    if str(args.arch).lower() == "conv_transformer":
-        dm, nh = int(args.trm_d_model), int(args.trm_nhead)
-        if dm % nh != 0:
-            _LOG.error("conv_transformer 要求 --trm-d-model（%d）能被 --trm-nhead（%d）整除", dm, nh)
-            raise SystemExit(2)
     save_dir: Path = args.save_dir
     save_dir.mkdir(parents=True, exist_ok=True)
     save_every = max(0, int(args.save_every))
@@ -247,34 +213,19 @@ def main() -> None:
         if args.resume:
             _LOG.error("--resume 需要 --checkpoint，或先有 %s", (save_dir / "last.pt").resolve())
             raise SystemExit(2)
-        if str(args.arch).lower() == "conv_transformer":
-            trm_ff = int(args.trm_ff) if int(args.trm_ff) > 0 else None
-            model = JointPolicyValueConvTrm(
-                stem_channels=int(args.stem_channels),
-                stem_num_res=int(args.stem_num_res),
-                policy_trunk_channels=int(args.policy_trunk_channels),
-                d_model=int(args.trm_d_model),
-                nhead=int(args.trm_nhead),
-                trm_layers=int(args.trm_layers),
-                dim_feedforward=trm_ff,
-            ).to(device)
-        else:
-            model = JointPolicyValueNet().to(device)
+        model = InceptionJointPolicyValueNet(stem_channels=int(args.inc_stem)).to(device)
         from mycchess_rl.chess import FEATURE_LIST
 
         flist = {"red": list(FEATURE_LIST["red"]), "black": list(FEATURE_LIST["black"])}
         model.eval()
-        _LOG.info("随机初始化策略网络 arch=%s", getattr(model, "arch", args.arch))
+        _LOG.info("随机初始化策略网络 arch=%s", getattr(model, "arch", "inception_joint"))
 
     n_params = sum(p.numel() for p in model.parameters())
-    arch_l = str(getattr(model, "arch", "resnet"))
-    if arch_l == "conv_transformer":
-        arch_desc = (
-            f"Conv双主干 in_ch={model.in_channels} pol_ch={getattr(model, 'policy_trunk_channels', '?')} "
-            f"val_d={getattr(model, 'd_model', '?')} trm_L={getattr(model, 'trm_layers', '?')} stem={getattr(model, 'stem_channels', '?')}"
-        )
-    else:
-        arch_desc = f"ResNet in_ch={model.in_channels} filters={model.filters} res={model.num_res_layers}"
+    td = int(model.backbone.out_dim)
+    arch_desc = (
+        f"Inception 共享主干 in_ch={model.in_channels} stem={model.stem_channels} "
+        f"inc_blocks={model.num_res_layers} trunk_dim={td}"
+    )
     _LOG.info(
         "设备=%s | n_env=%d steps=%d updates=%d lr=%g | %s | 参数量=%s",
         device,
